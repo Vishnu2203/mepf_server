@@ -95,27 +95,45 @@ def next_command(
     session_id: str = Query(default=""),
     db: Session = Depends(get_db),
 ):
-    if not machine_id:
-        return {}
+    """
+    Returns ALL pending commands for this machine in one response, not
+    just one. A single Revit process can have multiple documents open
+    at once, each with its own pending command targeted via document_id
+    inside "routing" - the agent's poll loop only runs once per machine,
+    so if we handed back one command at a time, a second document's
+    command would sit queued until the NEXT poll cycle. Handing back
+    every pending command now lets fetch_worker.py submit all of them
+    within the same cycle, so multiple documents get their commands
+    together instead of one-per-cycle.
 
-    row = (
+    Shape: {"commands": [ {command_id, routing, payload}, ... ]}
+    Empty list -> no work. (Old single-command shape is no longer used;
+    fetch_worker.py has been updated to read "commands".)
+    """
+    if not machine_id:
+        return {"commands": []}
+
+    rows = (
         db.query(CommandRecord)
         .filter(CommandRecord.machine_id == machine_id, CommandRecord.status == "pending")
         .order_by(CommandRecord.created_at.asc())
-        .first()
+        .all()
     )
-    if row is None:
-        return {}
+    if not rows:
+        return {"commands": []}
 
-    row.status = "delivered"
-    row.delivered_at = now()
+    out = []
+    for row in rows:
+        row.status = "delivered"
+        row.delivered_at = now()
+        out.append({
+            "command_id": row.command_id,
+            "routing": row.routing,
+            "payload": {"items": row.items},
+        })
     db.commit()
 
-    return {
-        "command_id": row.command_id,
-        "routing": row.routing,
-        "payload": {"items": row.items},
-    }
+    return {"commands": out}
 
 
 # ============================================================
