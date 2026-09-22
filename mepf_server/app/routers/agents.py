@@ -4,6 +4,7 @@ agents.py
 =============================================================================
 Implements:  POST /api/agents/register
              POST /api/agents/heartbeat
+             GET  /api/agents/list
 
 These are called every 30s by agent_registry.py on every Local Agent
 (pyRevit extension). This is the "System Registry" + "Document Registry"
@@ -24,6 +25,13 @@ Body shape sent by agent_registry.py's _body():
      }, ...
   ]
 }
+
+/list behavior (fix applied):
+  A machine only appears in /api/agents/list while its agent is actively
+  sending heartbeats (every 30s). If a machine hasn't been heard from in
+  OFFLINE_THRESHOLD_SEC (i.e. Revit was closed / agent stopped on THAT
+  machine), it is dropped from the list. Other machines that are still
+  sending heartbeats are completely unaffected.
 =============================================================================
 """
 from fastapi import APIRouter, Depends
@@ -32,6 +40,14 @@ from sqlalchemy.orm import Session
 from app.models.db import get_db, SystemRecord, DocumentRecord, now
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
+
+# Agent sends a heartbeat every 30s (see agent_registry.py / config
+# heartbeat_interval_sec). If a machine hasn't been heard from within this
+# many seconds, treat it as "Revit closed / agent stopped" for that
+# specific machine and drop it from /list. 3x the heartbeat interval gives
+# a small buffer for one missed beat or a slow request, without other
+# online machines being affected.
+OFFLINE_THRESHOLD_SEC = 90
 
 
 def _upsert_system(db: Session, machine_id: str, machine_name: str, status: str):
@@ -102,10 +118,30 @@ def heartbeat_agent(body: dict, db: Session = Depends(get_db)):
 
 @router.get("/list")
 def list_agents(db: Session = Depends(get_db)):
-    """Debug helper: view the current System Registry."""
+    """
+    Returns only machines that are CURRENTLY online, i.e. whose agent has
+    sent a heartbeat within OFFLINE_THRESHOLD_SEC.
+
+    - Revit open + agent heartbeating on a machine -> that machine appears.
+    - Revit closed on a machine (heartbeats stop) -> that machine alone
+      drops out once it goes stale. Every other machine still heart-
+      beating stays in the list untouched.
+    """
     rows = db.query(SystemRecord).all()
-    return [
-        {"machine_id": r.machine_id, "machine_name": r.machine_name,
-         "status": r.status, "last_seen": r.last_seen.isoformat() if r.last_seen else None}
-        for r in rows
-    ]
+    current_time = now()
+    result = []
+    for r in rows:
+        if r.last_seen is None:
+            continue
+        seconds_since = (current_time - r.last_seen).total_seconds()
+        if seconds_since > OFFLINE_THRESHOLD_SEC:
+            # Stale -> agent stopped heartbeating (Revit closed on this
+            # machine). Skip it; don't touch any other machine's row.
+            continue
+        result.append({
+            "machine_id": r.machine_id,
+            "machine_name": r.machine_name,
+            "status": "online",
+            "last_seen": r.last_seen.isoformat(),
+        })
+    return result
