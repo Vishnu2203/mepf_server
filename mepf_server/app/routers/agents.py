@@ -120,12 +120,22 @@ def heartbeat_agent(body: dict, db: Session = Depends(get_db)):
 def list_agents(db: Session = Depends(get_db)):
     """
     Returns only machines that are CURRENTLY online, i.e. whose agent has
-    sent a heartbeat within OFFLINE_THRESHOLD_SEC.
+    sent a heartbeat within OFFLINE_THRESHOLD_SEC. Each machine appears as
+    ONE row, with all of its currently-open Revit instances/documents
+    nested under "documents" — so multiple Revit instances on the same PC
+    are combined into a single entry instead of duplicating the machine
+    on every refresh.
 
-    - Revit open + agent heartbeating on a machine -> that machine appears.
+    - Revit open (one or more instances) + agent heartbeating on a
+      machine -> that machine appears once, documents array has one
+      entry per open instance.
     - Revit closed on a machine (heartbeats stop) -> that machine alone
       drops out once it goes stale. Every other machine still heart-
       beating stays in the list untouched.
+    - If a machine is online but just closed one of several open
+      documents, that document alone disappears from its "documents"
+      array (is_online flips False in _upsert_documents) while the
+      machine row itself stays, and its other open documents remain.
     """
     rows = db.query(SystemRecord).all()
     current_time = now()
@@ -138,10 +148,31 @@ def list_agents(db: Session = Depends(get_db)):
             # Stale -> agent stopped heartbeating (Revit closed on this
             # machine). Skip it; don't touch any other machine's row.
             continue
+
+        docs = (
+            db.query(DocumentRecord)
+            .filter(DocumentRecord.machine_id == r.machine_id, DocumentRecord.is_online == True)
+            .all()
+        )
+
         result.append({
             "machine_id": r.machine_id,
             "machine_name": r.machine_name,
             "status": "online",
             "last_seen": r.last_seen.isoformat(),
+            "documents": [
+                {
+                    "document_id": d.document_id,
+                    "revit_instance_id": d.revit_instance_id,
+                    "revit_process_id": d.revit_process_id,
+                    "session_id": d.session_id,
+                    "project_uid": d.project_uid,
+                    "document_title": d.document_title,
+                    "document_path": d.document_path,
+                    "revit_version": d.revit_version,
+                    "last_seen": d.last_seen.isoformat() if d.last_seen else None,
+                }
+                for d in docs
+            ],
         })
     return result
