@@ -34,7 +34,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.models.db import get_db, CommandRecord, CommandResultRecord, now
-from app.orchestrator.routing_engine import find_target_document, build_routing_block, RoutingError
+from app.orchestrator.routing_engine import (
+    find_target_document, build_routing_block, RoutingError, resolve_candidates,
+)
 
 router = APIRouter(prefix="/api/commands", tags=["commands"])
 
@@ -67,7 +69,10 @@ def create_command(body: dict, db: Session = Depends(get_db)):
     try:
         doc_row = find_target_document(db, selector)
     except RoutingError as ex:
-        raise HTTPException(status_code=409, detail={"code": ex.code, "message": ex.message})
+        raise HTTPException(
+            status_code=409,
+            detail={"code": ex.code, "message": ex.message, "candidates": ex.candidates},
+        )
 
     routing = build_routing_block(doc_row)
 
@@ -95,26 +100,45 @@ def next_command(
     session_id: str = Query(default=""),
     db: Session = Depends(get_db),
 ):
-    if not machine_id:
-        return {}
+    """Return ONE pending command belonging to THIS exact Revit instance.
 
-    row = (
+    The old implementation selected every pending command for a machine,
+    which allowed one Revit process to consume commands intended for another
+    Revit process on the same PC.
+    """
+    if not machine_id or not revit_process_id or not session_id:
+        return {"commands": []}
+
+    rows = (
         db.query(CommandRecord)
         .filter(CommandRecord.machine_id == machine_id, CommandRecord.status == "pending")
         .order_by(CommandRecord.created_at.asc())
-        .first()
+        .all()
     )
+
+    row = None
+    for candidate in rows:
+        routing = candidate.routing or {}
+        if str(routing.get("revit_process_id") or "") != str(revit_process_id):
+            continue
+        if str(routing.get("session_id") or "") != str(session_id):
+            continue
+        row = candidate
+        break
+
     if row is None:
-        return {}
+        return {"commands": []}
 
     row.status = "delivered"
     row.delivered_at = now()
     db.commit()
 
     return {
-        "command_id": row.command_id,
-        "routing": row.routing,
-        "payload": {"items": row.items},
+        "commands": [{
+            "command_id": row.command_id,
+            "routing": row.routing,
+            "payload": {"items": row.items},
+        }]
     }
 
 
@@ -142,6 +166,30 @@ def post_result(command_id: str, body: dict, db: Session = Depends(get_db)):
     db.commit()
 
     return {"status": "ok"}
+
+
+# ============================================================
+# RESOLVE  (preview matching BEFORE sending a real command - use this to
+#           debug 409s instead of guessing. Same matching rules as /create,
+#           but never raises: always returns exactly what would happen.)
+# ============================================================
+@router.post("/resolve")
+def resolve_target(body: dict, db: Session = Depends(get_db)):
+    """
+    body: { "target_selector": { ...same fields as /create... } }
+
+    Returns:
+      {"match_count": 0, "candidates": []}                -> would 409 no_target_online
+      {"match_count": 1, "candidates": [ {...one doc...} ]} -> would route cleanly
+      {"match_count": N, "candidates": [ {...N docs...} ]}  -> would 409 ambiguous_target,
+                                                                here's exactly why
+    Call this with your intended target_selector before POSTing the real
+    payload to /api/commands/create so you can see which machine/project/
+    document it will hit (or why it's ambiguous) without creating a command.
+    """
+    selector = body.get("target_selector") or {}
+    candidates = resolve_candidates(db, selector)
+    return {"match_count": len(candidates), "candidates": candidates}
 
 
 # ============================================================
