@@ -101,19 +101,26 @@ def next_command(
     db: Session = Depends(get_db),
 ):
     """
-    Returns ALL pending commands for this machine in one response, not
-    just one. A single Revit process can have multiple documents open
-    at once, each with its own pending command targeted via document_id
-    inside "routing" - the agent's poll loop only runs once per machine,
-    so if we handed back one command at a time, a second document's
-    command would sit queued until the NEXT poll cycle. Handing back
-    every pending command now lets fetch_worker.py submit all of them
-    within the same cycle, so multiple documents get their commands
-    together instead of one-per-cycle.
+    Returns pending commands for THIS specific Revit process on this
+    machine, not every pending command for the whole machine. A machine
+    can run multiple simultaneous Revit processes (multiple windows/
+    instances), each polling independently with its own revit_process_id/
+    session_id. A command is routed to one specific document, which lives
+    in exactly one of those processes - if /next handed a command to
+    whichever process happened to poll first regardless of routing, the
+    wrong process could pick it up, fail smart_target validation on the
+    agent side (wrong document), and the command would be marked
+    "delivered" and silently stranded forever, while the correct process
+    never sees it.
+
+    A command matches this poll only if its stored routing.revit_process_id
+    and routing.session_id equal the ones THIS process just sent - so each
+    process only ever receives commands actually routed to its own open
+    document.
 
     Shape: {"commands": [ {command_id, routing, payload}, ... ]}
-    Empty list -> no work. (Old single-command shape is no longer used;
-    fetch_worker.py has been updated to read "commands".)
+    Empty list -> no work for this specific process right now (it may
+    still be pending for a different process on the same machine).
     """
     if not machine_id:
         return {"commands": []}
@@ -127,8 +134,25 @@ def next_command(
     if not rows:
         return {"commands": []}
 
-    out = []
+    # Only hand out commands whose routing actually targets THIS process/
+    # session. Commands routed to a different process on the same machine
+    # stay "pending" so the correct process can still pick them up later.
+    matching = []
     for row in rows:
+        routing = row.routing or {}
+        row_process = str(routing.get("revit_process_id") or "")
+        row_session = str(routing.get("session_id") or "")
+        if revit_process_id and row_process and row_process != revit_process_id:
+            continue
+        if session_id and row_session and row_session != session_id:
+            continue
+        matching.append(row)
+
+    if not matching:
+        return {"commands": []}
+
+    out = []
+    for row in matching:
         row.status = "delivered"
         row.delivered_at = now()
         out.append({
@@ -189,6 +213,23 @@ def resolve_target(body: dict, db: Session = Depends(get_db)):
     selector = body.get("target_selector") or {}
     candidates = resolve_candidates(db, selector)
     return {"match_count": len(candidates), "candidates": candidates}
+
+
+# ============================================================
+# REQUEUE  (admin/debug: reset a stranded "delivered" command back to
+#           "pending" so it can be picked up again - e.g. after it was
+#           delivered to the wrong Revit process before the /next
+#           routing-scoping fix, and never got executed or reported)
+# ============================================================
+@router.post("/{command_id}/requeue")
+def requeue_command(command_id: str, db: Session = Depends(get_db)):
+    cmd = db.get(CommandRecord, command_id)
+    if cmd is None:
+        raise HTTPException(status_code=404, detail="Unknown command_id")
+    cmd.status = "pending"
+    cmd.delivered_at = None
+    db.commit()
+    return {"status": "requeued", "command_id": command_id}
 
 
 # ============================================================
