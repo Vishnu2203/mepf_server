@@ -14,14 +14,12 @@ that smart_target.validate_target() on the agent side checks field-by-field.
 from sqlalchemy.orm import Session
 
 from app.models.db import DocumentRecord, SystemRecord
-from app.routers.agents import mark_stale_offline
 
 
 class RoutingError(Exception):
-    def __init__(self, code, message, candidates=None):
+    def __init__(self, code, message):
         self.code = code
         self.message = message
-        self.candidates = candidates or []
         super().__init__(message)
 
 
@@ -31,17 +29,7 @@ def find_target_document(db: Session, selector: dict) -> DocumentRecord:
     document_path, machine_id, revit_version.
     Narrows the online document registry down using whichever fields are
     given. Raises RoutingError if zero or more-than-one match remains.
-
-    Sweeps stale documents/systems to offline first (same rule /api/agents
-    /list uses) so a machine whose agent crashed or stopped heartbeating -
-    and therefore can never send a fresh heartbeat to flip its old rows
-    to is_online=False itself - doesn't linger forever as a false "online"
-    match. Left unswept, those stale rows are exactly what produces
-    "ambiguous_target" (multiple stale + live rows matching the same
-    project_uid/machine_id) or silent routing to a dead agent that will
-    never actually create the elements.
     """
-    mark_stale_offline(db)
     q = db.query(DocumentRecord).filter(DocumentRecord.is_online.is_(True))
 
     if selector.get("document_id"):
@@ -60,64 +48,12 @@ def find_target_document(db: Session, selector: dict) -> DocumentRecord:
     if len(matches) == 0:
         raise RoutingError("no_target_online", "No online document matches the given selector.")
     if len(matches) > 1:
-        # Diagnostic detail so the caller can see exactly WHY it's ambiguous
-        # instead of guessing - each candidate's full identity is listed.
-        candidates = [
-            {
-                "document_id": m.document_id,
-                "machine_id": m.machine_id,
-                "project_uid": m.project_uid,
-                "document_title": m.document_title,
-                "document_path": m.document_path,
-                "revit_version": m.revit_version,
-            }
-            for m in matches
-        ]
         raise RoutingError(
             "ambiguous_target",
             "{0} online documents match this selector - narrow the selector "
-            "(add document_id, or machine_id + project_uid together). "
-            "See 'candidates' for exactly which documents matched.".format(len(matches)),
-            candidates=candidates,
+            "(e.g. add document_id or project_uid).".format(len(matches)),
         )
     return matches[0]
-
-
-def resolve_candidates(db: Session, selector: dict) -> list:
-    """
-    Non-raising version of find_target_document's matching step, for a
-    debug/preview endpoint: returns every online document that matches the
-    given selector (0, 1, or many) so a caller can see what would happen
-    BEFORE sending a real command and hitting a 409.
-    """
-    mark_stale_offline(db)
-    q = db.query(DocumentRecord).filter(DocumentRecord.is_online.is_(True))
-
-    if selector.get("document_id"):
-        q = q.filter(DocumentRecord.document_id == selector["document_id"])
-    if selector.get("project_uid"):
-        q = q.filter(DocumentRecord.project_uid == selector["project_uid"])
-    if selector.get("machine_id"):
-        q = q.filter(DocumentRecord.machine_id == selector["machine_id"])
-    if selector.get("document_title"):
-        q = q.filter(DocumentRecord.document_title == selector["document_title"])
-    if selector.get("revit_version"):
-        q = q.filter(DocumentRecord.revit_version == selector["revit_version"])
-
-    return [
-        {
-            "document_id": m.document_id,
-            "machine_id": m.machine_id,
-            "project_uid": m.project_uid,
-            "document_title": m.document_title,
-            "document_path": m.document_path,
-            "revit_version": m.revit_version,
-            "revit_process_id": m.revit_process_id,
-            "session_id": m.session_id,
-            "last_seen": m.last_seen.isoformat() if m.last_seen else None,
-        }
-        for m in q.all()
-    ]
 
 
 def build_routing_block(doc_row: DocumentRecord) -> dict:
