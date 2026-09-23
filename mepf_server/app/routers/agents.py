@@ -150,26 +150,44 @@ def heartbeat_agent(body: dict, db: Session = Depends(get_db)):
     return {"status": "ok", "machine_id": machine_id}
 
 
+@router.get("/debug/raw")
+def debug_raw(db: Session = Depends(get_db)):
+    """
+    Diagnostic only: dumps every DocumentRecord row exactly as stored, with
+    NO is_online filter and NO staleness sweep applied. Use this to see the
+    raw ground truth in the DB when /list shows a document but /resolve or
+    /create can't find it - it tells you whether the row actually has
+    is_online=True/False and what its real last_seen is, instead of
+    guessing about timing or environment differences.
+    """
+    docs = db.query(DocumentRecord).all()
+    current = now()
+    return {
+        "server_time_utc": current.isoformat(),
+        "documents": [
+            {
+                "document_id": d.document_id,
+                "machine_id": d.machine_id,
+                "project_uid": d.project_uid,
+                "document_title": d.document_title,
+                "is_online": d.is_online,
+                "last_seen": d.last_seen.isoformat() if d.last_seen else None,
+                "seconds_since_seen": (current - d.last_seen).total_seconds() if d.last_seen else None,
+            }
+            for d in docs
+        ],
+    }
+
+
 @router.get("/list")
 def list_agents(db: Session = Depends(get_db)):
     """
     Returns only machines that are CURRENTLY online, i.e. whose agent has
     sent a heartbeat within OFFLINE_THRESHOLD_SEC. Each machine appears as
     ONE row, with all of its currently-open Revit instances/documents
-    nested under "documents" — so multiple Revit instances on the same PC
+    nested under "documents" - so multiple Revit instances on the same PC
     are combined into a single entry instead of duplicating the machine
     on every refresh.
-
-    - Revit open (one or more instances) + agent heartbeating on a
-      machine -> that machine appears once, documents array has one
-      entry per open instance.
-    - Revit closed on a machine (heartbeats stop) -> that machine alone
-      drops out once it goes stale. Every other machine still heart-
-      beating stays in the list untouched.
-    - If a machine is online but just closed one of several open
-      documents, that document alone disappears from its "documents"
-      array (is_online flips False in _upsert_documents) while the
-      machine row itself stays, and its other open documents remain.
     """
     mark_stale_offline(db)
     rows = db.query(SystemRecord).all()
