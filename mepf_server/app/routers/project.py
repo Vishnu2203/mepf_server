@@ -28,11 +28,13 @@ router = APIRouter(prefix="/api/project", tags=["project"])
 
 @router.post("/ingest-auto")
 def ingest_auto(body: dict, db: Session = Depends(get_db)):
-    project = body.get("project") or {}
-    meta = body.get("meta") or {}
+    envelope = body.get("data") if isinstance(body.get("data"), dict) else body
+    routing = body.get("routing") or {}
+    project = envelope.get("project") or {}
+    meta = envelope.get("meta") or {}
 
-    project_uid = project.get("project_uid")
-    document_path = project.get("document_path")
+    project_uid = routing.get("project_uid") or project.get("project_uid")
+    document_path = routing.get("document_path") or project.get("document_path")
 
     # Best-effort resolve which registered document this extraction belongs
     # to, by project_uid (falls back to unmatched if not registered yet -
@@ -48,12 +50,12 @@ def ingest_auto(body: dict, db: Session = Depends(get_db)):
         if doc_row:
             document_id = doc_row.document_id
 
-    extraction_id = meta.get("extraction_id") or "EXT-{0}".format(uuid.uuid4())
+    extraction_id = routing.get("extraction_id") or meta.get("extraction_id") or "EXT-{0}".format(uuid.uuid4())
 
     row = ExtractionRecord(
         extraction_id=extraction_id,
-        machine_id=None,
-        document_id=document_id,
+        machine_id=routing.get("machine_id"),
+        document_id=routing.get("document_id") or document_id,
         project_uid=project_uid,
         payload=body,
     )
