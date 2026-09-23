@@ -7,7 +7,7 @@ Implements:  POST /api/agents/register
              GET  /api/agents/list
 
 These are called every 30s by agent_registry.py on every Local Agent
-(pyRevit extension). This is the "System Registry" + "Document Registry"
+(pyRevit extension). This is the "System Registry" + "Document Registry" 
 in your diagram — built dynamically, exactly as you decided:
   Local Agent starts -> auto-registers itself + every open document.
 
