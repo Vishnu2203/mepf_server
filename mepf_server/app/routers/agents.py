@@ -96,7 +96,7 @@ def _upsert_system(db: Session, machine_id: str, machine_name: str, status: str)
     return sys_row
 
 
-def _upsert_documents(db: Session, machine_id: str, documents: list):
+def _upsert_documents(db: Session, machine_id: str, revit_process_id: str, documents: list):
     seen_ids = set()
     for doc in documents or []:
         document_id = doc.get("document_id")
@@ -118,9 +118,27 @@ def _upsert_documents(db: Session, machine_id: str, documents: list):
         row.is_online = True
         row.last_seen = now()
 
-    # Any document previously registered for this machine but NOT present
-    # in this register/heartbeat call is now closed -> mark offline.
-    existing = db.query(DocumentRecord).filter(DocumentRecord.machine_id == machine_id).all()
+    # Any document previously registered for THIS SAME machine + Revit
+    # process but NOT present in this call is now closed -> mark offline.
+    # Scoped to revit_process_id as well as machine_id: a single machine
+    # can run multiple simultaneous Revit processes (e.g. two Revit
+    # windows/instances), each sending its own independent heartbeat with
+    # only ITS OWN currently-open documents. If this were scoped to
+    # machine_id alone, process A's heartbeat would incorrectly mark
+    # process B's still-open document offline (since it's not in A's
+    # list), and vice versa on B's next heartbeat 15-30s later - causing
+    # documents to flicker online/offline every cycle even though nothing
+    # actually closed. Scoping to (machine_id, revit_process_id) means
+    # each process's heartbeat only ever closes documents IT previously
+    # owned, never another process's.
+    existing = (
+        db.query(DocumentRecord)
+        .filter(
+            DocumentRecord.machine_id == machine_id,
+            DocumentRecord.revit_process_id == revit_process_id,
+        )
+        .all()
+    )
     for row in existing:
         if row.document_id not in seen_ids:
             row.is_online = False
@@ -129,11 +147,12 @@ def _upsert_documents(db: Session, machine_id: str, documents: list):
 @router.post("/register")
 def register_agent(body: dict, db: Session = Depends(get_db)):
     machine_id = body.get("machine_id", "")
+    revit_process_id = body.get("revit_process_id", "")
     documents = body.get("documents", [])
     machine_name = documents[0].get("machine_name") if documents else None
 
     _upsert_system(db, machine_id, machine_name, status="online")
-    _upsert_documents(db, machine_id, documents)
+    _upsert_documents(db, machine_id, revit_process_id, documents)
     db.commit()
     return {"status": "registered", "machine_id": machine_id, "documents_seen": len(documents)}
 
@@ -141,11 +160,12 @@ def register_agent(body: dict, db: Session = Depends(get_db)):
 @router.post("/heartbeat")
 def heartbeat_agent(body: dict, db: Session = Depends(get_db)):
     machine_id = body.get("machine_id", "")
+    revit_process_id = body.get("revit_process_id", "")
     documents = body.get("documents", [])
     machine_name = documents[0].get("machine_name") if documents else None
 
     _upsert_system(db, machine_id, machine_name, status="online")
-    _upsert_documents(db, machine_id, documents)
+    _upsert_documents(db, machine_id, revit_process_id, documents)
     db.commit()
     return {"status": "ok", "machine_id": machine_id}
 
