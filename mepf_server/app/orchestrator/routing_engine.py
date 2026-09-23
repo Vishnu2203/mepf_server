@@ -14,6 +14,7 @@ that smart_target.validate_target() on the agent side checks field-by-field.
 from sqlalchemy.orm import Session
 
 from app.models.db import DocumentRecord, SystemRecord
+from app.routers.agents import mark_stale_offline
 
 
 class RoutingError(Exception):
@@ -29,7 +30,17 @@ def find_target_document(db: Session, selector: dict) -> DocumentRecord:
     document_path, machine_id, revit_version.
     Narrows the online document registry down using whichever fields are
     given. Raises RoutingError if zero or more-than-one match remains.
+
+    Sweeps stale documents/systems to offline first (same rule /api/agents
+    /list uses) so a machine whose agent crashed or stopped heartbeating -
+    and therefore can never send a fresh heartbeat to flip its old rows
+    to is_online=False itself - doesn't linger forever as a false "online"
+    match. Left unswept, those stale rows are exactly what produces
+    "ambiguous_target" (multiple stale + live rows matching the same
+    project_uid/machine_id) or silent routing to a dead agent that will
+    never actually create the elements.
     """
+    mark_stale_offline(db)
     q = db.query(DocumentRecord).filter(DocumentRecord.is_online.is_(True))
 
     if selector.get("document_id"):
