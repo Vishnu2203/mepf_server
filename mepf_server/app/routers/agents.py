@@ -34,6 +34,8 @@ Body shape sent by agent_registry.py's _body():
   sending heartbeats are completely unaffected.
 =============================================================================
 """
+import datetime as dt
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -48,6 +50,38 @@ router = APIRouter(prefix="/api/agents", tags=["agents"])
 # a small buffer for one missed beat or a slow request, without other
 # online machines being affected.
 OFFLINE_THRESHOLD_SEC = 90
+
+
+def mark_stale_offline(db: Session):
+    """
+    Shared staleness sweep so every consumer of "is this document really
+    online" (this router's /list AND the routing engine's target matching)
+    agree on the same definition. A document/system whose agent stopped
+    heartbeating (crashed, network/import error, Revit closed) more than
+    OFFLINE_THRESHOLD_SEC ago is flipped to is_online/status=offline here,
+    instead of relying only on the *next* successful heartbeat to notice
+    it disappeared - which never happens if the agent can no longer talk
+    to the server at all.
+    """
+    cutoff = now() - dt.timedelta(seconds=OFFLINE_THRESHOLD_SEC)
+    stale_docs = (
+        db.query(DocumentRecord)
+        .filter(DocumentRecord.is_online.is_(True), DocumentRecord.last_seen < cutoff)
+        .all()
+    )
+    for row in stale_docs:
+        row.is_online = False
+
+    stale_systems = (
+        db.query(SystemRecord)
+        .filter(SystemRecord.status == "online", SystemRecord.last_seen < cutoff)
+        .all()
+    )
+    for row in stale_systems:
+        row.status = "offline"
+
+    if stale_docs or stale_systems:
+        db.commit()
 
 
 def _upsert_system(db: Session, machine_id: str, machine_name: str, status: str):
@@ -137,6 +171,7 @@ def list_agents(db: Session = Depends(get_db)):
       array (is_online flips False in _upsert_documents) while the
       machine row itself stays, and its other open documents remain.
     """
+    mark_stale_offline(db)
     rows = db.query(SystemRecord).all()
     current_time = now()
     result = []
