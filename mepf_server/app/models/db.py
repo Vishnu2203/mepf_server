@@ -23,7 +23,7 @@ import os
 import datetime as dt
 
 from sqlalchemy import (
-    create_engine, Column, String, Integer, Boolean, DateTime, Text, ForeignKey, JSON
+    create_engine, Column, String, Integer, Boolean, DateTime, Text, ForeignKey, JSON, Index, inspect, text as sql_text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -122,9 +122,19 @@ class CommandRecord(Base):
     routing = Column(JSON)                          # the exact {routing} block smart_target.py validates
     action = Column(String, default="place_mep_elements")
     items = Column(JSON)                            # the payload.items list (VAV/duct placement data etc.)
-    status = Column(String, default="pending")       # pending | delivered | committed | failed | timeout
-    created_at = Column(DateTime, default=now)
+    status = Column(String, default="PENDING", index=True)  # PENDING|CLAIMED|EXECUTING|SUCCEEDED|PARTIAL|FAILED|DEAD_LETTER|CANCELLED
+    created_at = Column(DateTime, default=now, index=True)
     delivered_at = Column(DateTime, nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+    execution_started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    lease_token = Column(String, nullable=True, index=True)
+    lease_owner = Column(String, nullable=True)
+    attempts = Column(Integer, default=0, nullable=False)
+    max_attempts = Column(Integer, default=3, nullable=False)
+    last_error = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=now, onupdate=now)
 
 
 class CommandResultRecord(Base):
@@ -138,8 +148,59 @@ class CommandResultRecord(Base):
     received_at = Column(DateTime, default=now)
 
 
+class AuditEventRecord(Base):
+    __tablename__ = "audit_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    command_id = Column(String, index=True, nullable=True)
+    event_type = Column(String, index=True, nullable=False)
+    actor = Column(String, nullable=True)
+    details = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=now, index=True)
+
+
+class IdempotencyRecord(Base):
+    __tablename__ = "idempotency_keys"
+
+    key = Column(String, primary_key=True)
+    command_id = Column(String, ForeignKey("commands.command_id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=now)
+
+
+Index("ix_commands_claimable", CommandRecord.machine_id, CommandRecord.status, CommandRecord.created_at)
+Index("ix_commands_lease", CommandRecord.status, CommandRecord.lease_expires_at)
+
+
+def _add_missing_columns():
+    """Small additive migration for installations created by older builds."""
+    inspector = inspect(engine)
+    existing = set(c["name"] for c in inspector.get_columns("commands")) if "commands" in inspector.get_table_names() else set()
+    additions = {
+        "status": "VARCHAR", "claimed_at": "TIMESTAMP", "execution_started_at": "TIMESTAMP",
+        "completed_at": "TIMESTAMP", "lease_expires_at": "TIMESTAMP", "lease_token": "VARCHAR",
+        "lease_owner": "VARCHAR", "attempts": "INTEGER DEFAULT 0", "max_attempts": "INTEGER DEFAULT 3",
+        "last_error": "TEXT", "updated_at": "TIMESTAMP",
+    }
+    if not existing:
+        return
+    with engine.begin() as conn:
+        for name, typ in additions.items():
+            if name not in existing:
+                conn.execute(sql_text("ALTER TABLE commands ADD COLUMN {} {}".format(name, typ)))
+        # Normalize legacy states from the pre-lease build. A previously
+        # delivered command had not been durably acknowledged by Revit, so it
+        # is deliberately returned to PENDING instead of being marked done.
+        conn.execute(sql_text("UPDATE commands SET status='PENDING' WHERE status='pending'"))
+        conn.execute(sql_text("UPDATE commands SET status='PENDING', lease_token=NULL, lease_owner=NULL, lease_expires_at=NULL WHERE status='delivered'"))
+        conn.execute(sql_text("UPDATE commands SET status='SUCCEEDED' WHERE status='committed'"))
+        conn.execute(sql_text("UPDATE commands SET status='FAILED' WHERE status='failed'"))
+        conn.execute(sql_text("UPDATE commands SET attempts=0 WHERE attempts IS NULL"))
+        conn.execute(sql_text("UPDATE commands SET max_attempts=3 WHERE max_attempts IS NULL"))
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _add_missing_columns()
 
 
 def get_db():
