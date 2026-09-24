@@ -21,6 +21,7 @@ Matches endpoint_config.py's defaults exactly:
 from fastapi import FastAPI
 
 from app.models.db import init_db
+import os
 from app.routers import agents, project, commands
 
 app = FastAPI(title="MEPF Central Server + Orchestrator")
@@ -37,7 +38,7 @@ def on_startup():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "MEPF Central Server + Orchestrator"}
+    return {"status": "ok", "service": "MEPF Central Server + Orchestrator", "api_key_configured": bool(os.environ.get("MEPF_API_KEY"))}
 
 
 @app.get("/health")
