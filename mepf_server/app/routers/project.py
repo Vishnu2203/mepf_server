@@ -19,11 +19,12 @@ This is the "Extraction Data (with identity)" arrow -> Central Server
 import uuid
 
 from fastapi import APIRouter, Depends
+from app.auth import require_api_key
 from sqlalchemy.orm import Session
 
 from app.models.db import get_db, ExtractionRecord, DocumentRecord
 
-router = APIRouter(prefix="/api/project", tags=["project"])
+router = APIRouter(prefix="/api/project", tags=["project"], dependencies=[Depends(require_api_key)])
 
 
 @router.post("/ingest-auto")
