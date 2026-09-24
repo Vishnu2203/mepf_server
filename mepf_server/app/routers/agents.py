@@ -40,8 +40,9 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.models.db import get_db, SystemRecord, DocumentRecord, now
+from app.auth import require_api_key
 
-router = APIRouter(prefix="/api/agents", tags=["agents"])
+router = APIRouter(prefix="/api/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
 
 # Agent sends a heartbeat every 30s (see agent_registry.py / config
 # heartbeat_interval_sec). If a machine hasn't been heard from within this
