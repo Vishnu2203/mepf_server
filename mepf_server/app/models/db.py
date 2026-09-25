@@ -164,6 +164,7 @@ class IdempotencyRecord(Base):
 
     key = Column(String, primary_key=True)
     command_id = Column(String, ForeignKey("commands.command_id"), nullable=False, index=True)
+    request_hash = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=now)
 
 
@@ -175,6 +176,7 @@ def _add_missing_columns():
     """Small additive migration for installations created by older builds."""
     inspector = inspect(engine)
     existing = set(c["name"] for c in inspector.get_columns("commands")) if "commands" in inspector.get_table_names() else set()
+    existing_idempotency = set(c["name"] for c in inspector.get_columns("idempotency_keys")) if "idempotency_keys" in inspector.get_table_names() else set()
     additions = {
         "status": "VARCHAR", "claimed_at": "TIMESTAMP", "execution_started_at": "TIMESTAMP",
         "completed_at": "TIMESTAMP", "lease_expires_at": "TIMESTAMP", "lease_token": "VARCHAR",
@@ -187,6 +189,8 @@ def _add_missing_columns():
         for name, typ in additions.items():
             if name not in existing:
                 conn.execute(sql_text("ALTER TABLE commands ADD COLUMN {} {}".format(name, typ)))
+        if "request_hash" not in existing_idempotency and existing_idempotency:
+            conn.execute(sql_text("ALTER TABLE idempotency_keys ADD COLUMN request_hash VARCHAR"))
         # Normalize legacy states from the pre-lease build. A previously
         # delivered command had not been durably acknowledged by Revit, so it
         # is deliberately returned to PENDING instead of being marked done.
