@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 import uuid
 import datetime as dt
+import hashlib
+import json
+import os
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.auth import require_api_key
 from app.models.db import (
@@ -14,10 +18,13 @@ from app.orchestrator.routing_engine import find_target_document, build_routing_
 
 router = APIRouter(prefix="/api/commands", tags=["commands"], dependencies=[Depends(require_api_key)])
 LEASE_SEC = int(__import__('os').environ.get("COMMAND_LEASE_SEC", "300"))
-MAX_ATTEMPTS = int(__import__('os').environ.get("COMMAND_MAX_ATTEMPTS", "3"))
+MAX_ATTEMPTS = int(os.environ.get("COMMAND_MAX_ATTEMPTS", "3"))
+MAX_ITEMS = int(os.environ.get("COMMAND_MAX_ITEMS", "5000"))
+MAX_PAYLOAD_BYTES = int(os.environ.get("COMMAND_MAX_PAYLOAD_BYTES", "5000000"))
+ALLOWED_SELECTOR_KEYS = {"document_id", "project_uid", "machine_id", "document_title", "document_path", "revit_version", "revit_instance_id", "revit_process_id", "session_id"}
 
 class CreateCommand(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
     action: str = "place_mep_elements"
     items: list = Field(default_factory=list)
     target_selector: dict = Field(default_factory=dict)
@@ -34,6 +41,37 @@ class CommandResult(BaseModel):
 
 def _audit(db, command_id, event_type, actor, details=None):
     db.add(AuditEventRecord(command_id=command_id, event_type=event_type, actor=actor, details=details or {}))
+
+
+def _request_fingerprint(body: CreateCommand) -> str:
+    canonical = {
+        "action": body.action,
+        "items": body.items,
+        "target_selector": body.target_selector,
+        "max_attempts": body.max_attempts,
+    }
+    raw = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _validate_create_request(body: CreateCommand):
+    if not body.action.strip():
+        raise HTTPException(status_code=422, detail="action must not be empty")
+    if not isinstance(body.target_selector, dict) or not body.target_selector:
+        raise HTTPException(status_code=422, detail="target_selector is required; never route by list position or by an implicit single-agent match")
+    unknown = sorted(set(body.target_selector) - ALLOWED_SELECTOR_KEYS)
+    if unknown:
+        raise HTTPException(status_code=422, detail={"code": "unknown_target_selector_fields", "fields": unknown})
+    if not any(str(body.target_selector.get(k) or "").strip() for k in ("document_id", "revit_instance_id", "revit_process_id", "session_id", "machine_id", "project_uid", "document_path")):
+        raise HTTPException(status_code=422, detail="target_selector must contain at least one real identity field")
+    if len(body.items) > MAX_ITEMS:
+        raise HTTPException(status_code=413, detail="items exceeds COMMAND_MAX_ITEMS")
+    try:
+        payload_size = len(json.dumps(body.items, separators=(",", ":"), ensure_ascii=True, default=str).encode("utf-8"))
+    except Exception as ex:
+        raise HTTPException(status_code=422, detail="items could not be serialized: {}".format(ex))
+    if payload_size > MAX_PAYLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="items payload exceeds COMMAND_MAX_PAYLOAD_BYTES")
 
 def _expire_leases(db):
     current = now()
@@ -64,11 +102,17 @@ def create_command(body: CreateCommand, db: Session = Depends(get_db)):
     _expire_leases(db)
     if not body.items:
         raise HTTPException(status_code=422, detail="items must contain at least one work item")
+    _validate_create_request(body)
+    request_hash = _request_fingerprint(body)
     if body.idempotency_key:
         existing = db.get(IdempotencyRecord, body.idempotency_key)
         if existing:
+            if existing.request_hash and existing.request_hash != request_hash:
+                raise HTTPException(status_code=409, detail="idempotency_key was already used for a different command payload")
             cmd = db.get(CommandRecord, existing.command_id)
-            return {"status": "existing", "command_id": cmd.command_id, "machine_id": cmd.machine_id, "routing": cmd.routing}
+            if cmd is None:
+                raise HTTPException(status_code=409, detail="idempotency_key points to a missing command")
+            return {"status": "existing", "command_id": cmd.command_id, "machine_id": cmd.machine_id, "routing": cmd.routing, "command_status": cmd.status}
     try:
         doc_row = find_target_document(db, body.target_selector)
     except RoutingError as ex:
@@ -78,15 +122,27 @@ def create_command(body: CreateCommand, db: Session = Depends(get_db)):
     row = CommandRecord(command_id=command_id, machine_id=doc_row.machine_id, routing=routing, action=body.action, items=body.items, status="PENDING", max_attempts=body.max_attempts)
     db.add(row)
     if body.idempotency_key:
-        db.add(IdempotencyRecord(key=body.idempotency_key, command_id=command_id))
+        db.add(IdempotencyRecord(key=body.idempotency_key, command_id=command_id, request_hash=request_hash))
     _audit(db, command_id, "CREATED", "api", {"machine_id": doc_row.machine_id, "action": body.action})
-    db.commit()
-    return {"status": "routed", "command_id": command_id, "machine_id": doc_row.machine_id, "routing": routing}
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if body.idempotency_key:
+            existing = db.get(IdempotencyRecord, body.idempotency_key)
+            if existing:
+                cmd = db.get(CommandRecord, existing.command_id)
+                if cmd and (not existing.request_hash or existing.request_hash == request_hash):
+                    return {"status": "existing", "command_id": cmd.command_id, "machine_id": cmd.machine_id, "routing": cmd.routing, "command_status": cmd.status}
+        raise HTTPException(status_code=409, detail="Command could not be committed because a unique record already exists")
+    return {"status": "queued", "routing_status": "target_resolved", "command_id": command_id, "machine_id": doc_row.machine_id, "routing": routing, "command_status": "PENDING"}
 
 @router.get("/next")
-def next_command(machine_id: str = Query(default=""), revit_process_id: str = Query(default=""), session_id: str = Query(default=""), db: Session = Depends(get_db)):
+def next_command(machine_id: str = Query(default=""), revit_process_id: str = Query(default=""), session_id: str = Query(default=""), x_workstation_id: str = Header(default=""), db: Session = Depends(get_db)):
     if not machine_id or not revit_process_id or not session_id:
         return {"commands": []}
+    if not x_workstation_id or x_workstation_id != machine_id:
+        raise HTTPException(status_code=401, detail="X-Workstation-Id must match machine_id")
     _expire_leases(db)
     owner = "{}:{}:{}".format(machine_id, revit_process_id, session_id)
     candidates = (db.query(CommandRecord)
@@ -137,6 +193,8 @@ def post_result(command_id: str, body: CommandResult, db: Session = Depends(get_
     cmd = db.get(CommandRecord, command_id)
     if cmd is None:
         raise HTTPException(status_code=404, detail="Unknown command_id")
+    if body.command_id != command_id:
+        raise HTTPException(status_code=422, detail="body.command_id must match the URL command_id")
     # Terminal result is durable/idempotent.
     if cmd.status in ("SUCCEEDED", "PARTIAL", "FAILED", "DEAD_LETTER", "CANCELLED"):
         return {"status": "already_terminal", "command_id": command_id, "command_status": cmd.status}
@@ -195,4 +253,4 @@ def command_detail(command_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Unknown command_id")
     results = db.query(CommandResultRecord).filter(CommandResultRecord.command_id == command_id).order_by(CommandResultRecord.received_at.desc()).all()
     events = db.query(AuditEventRecord).filter(AuditEventRecord.command_id == command_id).order_by(AuditEventRecord.created_at.asc()).all()
-    return {"command_id":row.command_id,"status":row.status,"machine_id":row.machine_id,"routing":row.routing,"action":row.action,"attempts":row.attempts,"max_attempts":row.max_attempts,"lease_owner":row.lease_owner,"lease_expires_at":row.lease_expires_at.isoformat() if row.lease_expires_at else None,"results":[{"status":r.status,"result":r.result,"received_at":r.received_at.isoformat()} for r in results],"audit":[{"event_type":e.event_type,"actor":e.actor,"details":e.details,"created_at":e.created_at.isoformat()} for e in events]}
+    return {"command_id":row.command_id,"status":row.status,"machine_id":row.machine_id,"routing":row.routing,"action":row.action,"attempts":row.attempts,"max_attempts":row.max_attempts,"created_at":row.created_at.isoformat() if row.created_at else None,"delivered_at":row.delivered_at.isoformat() if row.delivered_at else None,"execution_started_at":row.execution_started_at.isoformat() if row.execution_started_at else None,"completed_at":row.completed_at.isoformat() if row.completed_at else None,"last_error":row.last_error,"lease_owner":row.lease_owner,"lease_expires_at":row.lease_expires_at.isoformat() if row.lease_expires_at else None,"results":[{"status":r.status,"result":r.result,"received_at":r.received_at.isoformat()} for r in results],"audit":[{"event_type":e.event_type,"actor":e.actor,"details":e.details,"created_at":e.created_at.isoformat()} for e in events]}
