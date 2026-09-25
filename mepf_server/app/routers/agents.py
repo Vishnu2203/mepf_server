@@ -36,7 +36,7 @@ Body shape sent by agent_registry.py's _body():
 """
 import datetime as dt
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.db import get_db, SystemRecord, DocumentRecord, now
@@ -83,6 +83,31 @@ def mark_stale_offline(db: Session):
 
     if stale_docs or stale_systems:
         db.commit()
+
+
+def _validate_agent_identity(body: dict, x_workstation_id: str):
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="agent body must be a JSON object")
+    machine_id = str(body.get("machine_id") or "").strip()
+    process_id = str(body.get("revit_process_id") or "").strip()
+    session_id = str(body.get("session_id") or "").strip()
+    documents = body.get("documents")
+    if not machine_id or not process_id or not session_id:
+        raise HTTPException(status_code=422, detail="machine_id, revit_process_id and session_id are required")
+    if not x_workstation_id:
+        raise HTTPException(status_code=401, detail="X-Workstation-Id is required for agent registration")
+    if x_workstation_id != machine_id:
+        raise HTTPException(status_code=401, detail="X-Workstation-Id does not match machine_id")
+    if not isinstance(documents, list):
+        raise HTTPException(status_code=422, detail="documents must be a list")
+    for i, doc in enumerate(documents):
+        if not isinstance(doc, dict):
+            raise HTTPException(status_code=422, detail="documents[{}] must be an object".format(i))
+        for key in ("document_id", "revit_instance_id", "revit_process_id", "session_id"):
+            if not str(doc.get(key) or "").strip():
+                raise HTTPException(status_code=422, detail="documents[{}].{} is required".format(i, key))
+        if str(doc.get("revit_process_id")) != process_id or str(doc.get("session_id")) != session_id:
+            raise HTTPException(status_code=422, detail="document identity does not match the registering Revit process/session")
 
 
 def _upsert_system(db: Session, machine_id: str, machine_name: str, status: str):
@@ -143,7 +168,8 @@ def _upsert_documents(db: Session, machine_id: str, agent_instance_id: str, agen
 
 
 @router.post("/register")
-def register_agent(body: dict, db: Session = Depends(get_db)):
+def register_agent(body: dict, db: Session = Depends(get_db), x_workstation_id: str = Header(default="")):
+    _validate_agent_identity(body, x_workstation_id)
     machine_id = body.get("machine_id", "")
     documents = body.get("documents", [])
     machine_name = documents[0].get("machine_name") if documents else None
@@ -157,7 +183,8 @@ def register_agent(body: dict, db: Session = Depends(get_db)):
 
 
 @router.post("/heartbeat")
-def heartbeat_agent(body: dict, db: Session = Depends(get_db)):
+def heartbeat_agent(body: dict, db: Session = Depends(get_db), x_workstation_id: str = Header(default="")):
+    _validate_agent_identity(body, x_workstation_id)
     machine_id = body.get("machine_id", "")
     documents = body.get("documents", [])
     machine_name = documents[0].get("machine_name") if documents else None
