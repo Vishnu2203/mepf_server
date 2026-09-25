@@ -202,12 +202,12 @@ def debug_raw(db: Session = Depends(get_db)):
 @router.get("/list")
 def list_agents(db: Session = Depends(get_db)):
     """
-    Returns only machines that are CURRENTLY online, i.e. whose agent has
+    Returns ALL machines that are CURRENTLY online, i.e. whose agent has
     sent a heartbeat within OFFLINE_THRESHOLD_SEC. Each machine appears as
-    ONE row, with all of its currently-open Revit instances/documents
-    nested under "documents" - so multiple Revit instances on the same PC
-    are combined into a single entry instead of duplicating the machine
-    on every refresh.
+    ONE row. The response keeps the legacy flat "documents" list and also
+    exposes "revit_instances", grouped as machine -> Revit instance ->
+    document. The caller can therefore display every live system first and
+    only create a command after the user selects an exact target.
     """
     mark_stale_offline(db)
     rows = db.query(SystemRecord).all()
@@ -228,11 +228,43 @@ def list_agents(db: Session = Depends(get_db)):
             .all()
         )
 
+        # Build an explicit hierarchy:
+        #   machine -> Revit instance -> open documents
+        # This lets the caller show ALL live systems first and then let the
+        # user choose the exact Revit process/document.
+        instance_map = {}
+        for d in docs:
+            instance_id = d.revit_instance_id or ""
+            instance = instance_map.setdefault(instance_id, {
+                "revit_instance_id": d.revit_instance_id,
+                "revit_process_id": d.revit_process_id,
+                "session_id": d.session_id,
+                "revit_version": d.revit_version,
+                "documents": [],
+            })
+            instance["documents"].append({
+                "document_id": d.document_id,
+                "project_uid": d.project_uid,
+                "document_title": d.document_title,
+                "document_path": d.document_path,
+                "revit_version": d.revit_version,
+                "last_seen": d.last_seen.isoformat() if d.last_seen else None,
+            })
+
+        # Stable ordering makes the UI predictable between refreshes.
+        for instance in instance_map.values():
+            instance["documents"].sort(key=lambda x: (x["document_title"] or "", x["document_id"] or ""))
+        revit_instances = sorted(
+            instance_map.values(),
+            key=lambda x: (str(x.get("revit_process_id") or ""), str(x.get("revit_instance_id") or "")),
+        )
+
         result.append({
             "machine_id": r.machine_id,
             "machine_name": r.machine_name,
             "status": "online",
             "last_seen": r.last_seen.isoformat(),
+            # Backward-compatible flat list. Existing clients can keep using it.
             "documents": [
                 {
                     "document_id": d.document_id,
@@ -247,5 +279,10 @@ def list_agents(db: Session = Depends(get_db)):
                 }
                 for d in docs
             ],
+            # New explicit hierarchy for the "show all systems first" UI.
+            "revit_instances": revit_instances,
         })
+
+    # The user should see the complete live registry before selecting a target.
+    result.sort(key=lambda x: (str(x.get("machine_name") or "").lower(), str(x.get("machine_id") or "")))
     return result
