@@ -10,6 +10,8 @@ services:
         fromDatabase:
           name: mepf-postgres
           property: connectionString
+      - key: MEPF_API_KEY
+        sync: false
 
 databases:
   - name: mepf-postgres
