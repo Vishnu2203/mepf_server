@@ -40,6 +40,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.db import get_db, SystemRecord, DocumentRecord, now
+import uuid
 from app.auth import require_api_key
 
 router = APIRouter(prefix="/api/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
@@ -89,6 +90,7 @@ def _validate_agent_identity(body: dict, x_workstation_id: str):
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="agent body must be a JSON object")
     machine_id = str(body.get("machine_id") or "").strip()
+    agent_id = str(body.get("agent_id") or "").strip()
     process_id = str(body.get("revit_process_id") or "").strip()
     session_id = str(body.get("session_id") or "").strip()
     documents = body.get("documents")
@@ -110,12 +112,19 @@ def _validate_agent_identity(body: dict, x_workstation_id: str):
             raise HTTPException(status_code=422, detail="document identity does not match the registering Revit process/session")
 
 
-def _upsert_system(db: Session, machine_id: str, machine_name: str, status: str):
+def _upsert_system(db: Session, machine_id: str, agent_id: str, machine_name: str, status: str):
     sys_row = db.get(SystemRecord, machine_id)
     if sys_row is None:
-        sys_row = SystemRecord(machine_id=machine_id, machine_name=machine_name, status=status)
+        sys_row = SystemRecord(machine_id=machine_id, agent_id=agent_id or "AGENT-{}".format(uuid.uuid4().hex[:12].upper()), machine_name=machine_name, status=status)
         db.add(sys_row)
     else:
+        if agent_id and sys_row.agent_id and sys_row.agent_id != agent_id:
+            raise HTTPException(status_code=409, detail="agent_id is already bound to a different identity for this machine")
+        if agent_id:
+            owner = db.query(SystemRecord).filter(SystemRecord.agent_id == agent_id, SystemRecord.machine_id != machine_id).first()
+            if owner:
+                raise HTTPException(status_code=409, detail="agent_id is already registered to another machine")
+            sys_row.agent_id = agent_id
         sys_row.machine_name = machine_name or sys_row.machine_name
         sys_row.status = status
         sys_row.last_seen = now()
@@ -174,12 +183,14 @@ def register_agent(body: dict, db: Session = Depends(get_db), x_workstation_id: 
     documents = body.get("documents", [])
     machine_name = documents[0].get("machine_name") if documents else None
     agent_instance_id = body.get("revit_instance_id", "")
+    agent_id = str(body.get("agent_id") or "").strip()
     agent_session_id = body.get("session_id", "")
 
-    _upsert_system(db, machine_id, machine_name, status="online")
+    _upsert_system(db, machine_id, agent_id, machine_name, status="online")
     _upsert_documents(db, machine_id, agent_instance_id, agent_session_id, documents)
     db.commit()
-    return {"status": "registered", "machine_id": machine_id, "documents_seen": len(documents)}
+    sys_row = db.get(SystemRecord, machine_id)
+    return {"status": "registered", "agent_id": sys_row.agent_id, "machine_id": machine_id, "documents_seen": len(documents)}
 
 
 @router.post("/heartbeat")
@@ -189,12 +200,14 @@ def heartbeat_agent(body: dict, db: Session = Depends(get_db), x_workstation_id:
     documents = body.get("documents", [])
     machine_name = documents[0].get("machine_name") if documents else None
     agent_instance_id = body.get("revit_instance_id", "")
+    agent_id = str(body.get("agent_id") or "").strip()
     agent_session_id = body.get("session_id", "")
 
-    _upsert_system(db, machine_id, machine_name, status="online")
+    _upsert_system(db, machine_id, agent_id, machine_name, status="online")
     _upsert_documents(db, machine_id, agent_instance_id, agent_session_id, documents)
     db.commit()
-    return {"status": "ok", "machine_id": machine_id}
+    sys_row = db.get(SystemRecord, machine_id)
+    return {"status": "ok", "agent_id": sys_row.agent_id, "machine_id": machine_id}
 
 
 @router.get("/debug/raw")
@@ -287,6 +300,7 @@ def list_agents(db: Session = Depends(get_db)):
         )
 
         result.append({
+            "agent_id": r.agent_id,
             "machine_id": r.machine_id,
             "machine_name": r.machine_name,
             "status": "online",
