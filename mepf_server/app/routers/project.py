@@ -21,6 +21,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from app.auth import require_api_key
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from app.models.db import get_db, ExtractionRecord, DocumentRecord, SystemRecord
 
@@ -68,9 +69,19 @@ def ingest_auto(body: dict, db: Session = Depends(get_db)):
         if not doc_row.is_online:
             raise HTTPException(status_code=409, detail="document_id is not currently online")
     else:
+        # document_id may be absent when FamilyExtract is running without the
+        # routing envelope (for example an older extension was left installed).
+        # In that case document_path is the strongest available document-level
+        # identity and MUST be used. project_uid alone is not sufficient when
+        # the same project is open on multiple systems.
         q = db.query(DocumentRecord).filter(DocumentRecord.is_online.is_(True))
         if project_uid:
             q = q.filter(DocumentRecord.project_uid == project_uid)
+        if document_path:
+            # Windows paths are case-insensitive. Match normalized case so a
+            # path casing difference does not create a false "ambiguous / not
+            # found" result. Slash normalization is handled by the clients.
+            q = q.filter(func.lower(DocumentRecord.document_path) == document_path.lower())
         if machine_id:
             q = q.filter(DocumentRecord.machine_id == machine_id)
         if revit_instance_id:
@@ -83,9 +94,15 @@ def ingest_auto(body: dict, db: Session = Depends(get_db)):
         if len(matches) == 1:
             doc_row = matches[0]
         elif len(matches) == 0:
-            raise HTTPException(status_code=409, detail="extraction target document could not be resolved uniquely")
+            raise HTTPException(status_code=409, detail=(
+                "extraction target document could not be resolved; "
+                "no online document matches the supplied project/document identity"
+            ))
         else:
-            raise HTTPException(status_code=409, detail="project_uid matches multiple online documents; include document_id or agent_id + document identity")
+            raise HTTPException(status_code=409, detail=(
+                "extraction target document is ambiguous; provide document_id "
+                "or a unique agent_id + document_path"
+            ))
 
     extraction_id = routing.get("extraction_id") or meta.get("extraction_id") or "EXT-{0}".format(uuid.uuid4())
 
@@ -93,7 +110,7 @@ def ingest_auto(body: dict, db: Session = Depends(get_db)):
         extraction_id=extraction_id,
         machine_id=machine_id or (doc_row.machine_id if doc_row else None),
         agent_id=agent_id or (db.get(SystemRecord, doc_row.machine_id).agent_id if doc_row and db.get(SystemRecord, doc_row.machine_id) else None),
-        document_id=document_id or (doc_row.document_id if doc_row else None),
+        document_id=(doc_row.document_id if doc_row else document_id),
         project_uid=project_uid,
         payload=body,
     )
