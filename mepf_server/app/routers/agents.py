@@ -118,12 +118,17 @@ def _upsert_system(db: Session, machine_id: str, agent_id: str, machine_name: st
         sys_row = SystemRecord(machine_id=machine_id, agent_id=agent_id or "AGENT-{}".format(uuid.uuid4().hex[:12].upper()), machine_name=machine_name, status=status)
         db.add(sys_row)
     else:
-        if agent_id and sys_row.agent_id and sys_row.agent_id != agent_id:
-            raise HTTPException(status_code=409, detail="agent_id is already bound to a different identity for this machine")
         if agent_id:
-            owner = db.query(SystemRecord).filter(SystemRecord.agent_id == agent_id, SystemRecord.machine_id != machine_id).first()
+            owner = db.query(SystemRecord).filter(
+                SystemRecord.agent_id == agent_id,
+                SystemRecord.machine_id != machine_id,
+            ).first()
             if owner:
                 raise HTTPException(status_code=409, detail="agent_id is already registered to another machine")
+            # The agent owns its stable ID in endpoint_config.json. Allow an
+            # existing server row to adopt that ID during an upgrade (older
+            # servers may have generated a temporary AGENT-* value), but never
+            # allow the same agent_id to move to another machine.
             sys_row.agent_id = agent_id
         sys_row.machine_name = machine_name or sys_row.machine_name
         sys_row.status = status
