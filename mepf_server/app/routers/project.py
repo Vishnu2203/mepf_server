@@ -18,11 +18,11 @@ This is the "Extraction Data (with identity)" arrow -> Central Server
 """
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from app.auth import require_api_key
 from sqlalchemy.orm import Session
 
-from app.models.db import get_db, ExtractionRecord, DocumentRecord
+from app.models.db import get_db, ExtractionRecord, DocumentRecord, SystemRecord
 
 router = APIRouter(prefix="/api/project", tags=["project"], dependencies=[Depends(require_api_key)])
 
@@ -37,30 +37,67 @@ def ingest_auto(body: dict, db: Session = Depends(get_db)):
     project_uid = routing.get("project_uid") or project.get("project_uid")
     document_path = routing.get("document_path") or project.get("document_path")
 
-    # Best-effort resolve which registered document this extraction belongs
-    # to, by project_uid (falls back to unmatched if not registered yet -
-    # the extraction is still stored either way).
-    document_id = None
-    if project_uid:
-        doc_row = (
-            db.query(DocumentRecord)
-            .filter(DocumentRecord.project_uid == project_uid)
-            .order_by(DocumentRecord.last_seen.desc())
-            .first()
-        )
-        if doc_row:
-            document_id = doc_row.document_id
+    # Resolve the extraction to the exact live document when identity metadata
+    # is present. project_uid alone is NOT unique when the same project is open
+    # on multiple systems, so never silently choose the most recently-seen
+    # document in that case.
+    agent_id = (routing.get("agent_id") or meta.get("agent_id") or "").strip()
+    machine_id = (routing.get("machine_id") or meta.get("machine_id") or "").strip()
+    document_id = (routing.get("document_id") or meta.get("document_id") or "").strip()
+    revit_instance_id = (routing.get("revit_instance_id") or meta.get("revit_instance_id") or "").strip()
+    session_id = (routing.get("session_id") or meta.get("session_id") or "").strip()
+
+    if document_id:
+        doc_row = db.get(DocumentRecord, document_id)
+        if doc_row is None:
+            raise HTTPException(status_code=409, detail="document_id is not registered")
+        if project_uid and doc_row.project_uid and doc_row.project_uid != project_uid:
+            raise HTTPException(status_code=409, detail="project_uid does not match document_id")
+        if machine_id and doc_row.machine_id != machine_id:
+            raise HTTPException(status_code=409, detail="machine_id does not own document_id")
+        if revit_instance_id and doc_row.revit_instance_id != revit_instance_id:
+            raise HTTPException(status_code=409, detail="revit_instance_id does not match document_id")
+        if session_id and doc_row.session_id != session_id:
+            raise HTTPException(status_code=409, detail="session_id does not match document_id")
+        if document_path and doc_row.document_path and doc_row.document_path != document_path:
+            raise HTTPException(status_code=409, detail="document_path does not match document_id")
+        if agent_id:
+            system = db.get(SystemRecord, doc_row.machine_id)
+            if system is None or system.agent_id != agent_id:
+                raise HTTPException(status_code=409, detail="agent_id does not own document_id")
+        if not doc_row.is_online:
+            raise HTTPException(status_code=409, detail="document_id is not currently online")
+    else:
+        q = db.query(DocumentRecord).filter(DocumentRecord.is_online.is_(True))
+        if project_uid:
+            q = q.filter(DocumentRecord.project_uid == project_uid)
+        if machine_id:
+            q = q.filter(DocumentRecord.machine_id == machine_id)
+        if revit_instance_id:
+            q = q.filter(DocumentRecord.revit_instance_id == revit_instance_id)
+        if session_id:
+            q = q.filter(DocumentRecord.session_id == session_id)
+        if agent_id:
+            q = q.join(SystemRecord, DocumentRecord.machine_id == SystemRecord.machine_id).filter(SystemRecord.agent_id == agent_id)
+        matches = q.all()
+        if len(matches) == 1:
+            doc_row = matches[0]
+        elif len(matches) == 0:
+            raise HTTPException(status_code=409, detail="extraction target document could not be resolved uniquely")
+        else:
+            raise HTTPException(status_code=409, detail="project_uid matches multiple online documents; include document_id or agent_id + document identity")
 
     extraction_id = routing.get("extraction_id") or meta.get("extraction_id") or "EXT-{0}".format(uuid.uuid4())
 
     row = ExtractionRecord(
         extraction_id=extraction_id,
-        machine_id=routing.get("machine_id"),
-        document_id=routing.get("document_id") or document_id,
+        machine_id=machine_id or (doc_row.machine_id if doc_row else None),
+        agent_id=agent_id or (db.get(SystemRecord, doc_row.machine_id).agent_id if doc_row and db.get(SystemRecord, doc_row.machine_id) else None),
+        document_id=document_id or (doc_row.document_id if doc_row else None),
         project_uid=project_uid,
         payload=body,
     )
     db.add(row)
     db.commit()
 
-    return {"status": "received", "extraction_id": extraction_id, "matched_document_id": document_id}
+    return {"status": "received", "extraction_id": extraction_id, "matched_document_id": doc_row.document_id if doc_row else None, "agent_id": agent_id or (db.get(SystemRecord, doc_row.machine_id).agent_id if doc_row and db.get(SystemRecord, doc_row.machine_id) else None)}
