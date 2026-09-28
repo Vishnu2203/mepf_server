@@ -54,6 +54,8 @@ def find_target_document(db: Session, selector: dict) -> DocumentRecord:
         q = q.filter(DocumentRecord.machine_id == selector["machine_id"])
     if selector.get("document_title"):
         q = q.filter(DocumentRecord.document_title == selector["document_title"])
+    if selector.get("document_path"):
+        q = q.filter(DocumentRecord.document_path == selector["document_path"])
     if selector.get("revit_version"):
         q = q.filter(DocumentRecord.revit_version == selector["revit_version"])
     if selector.get("revit_instance_id"):
@@ -112,6 +114,8 @@ def resolve_candidates(db: Session, selector: dict) -> list:
         q = q.filter(DocumentRecord.machine_id == selector["machine_id"])
     if selector.get("document_title"):
         q = q.filter(DocumentRecord.document_title == selector["document_title"])
+    if selector.get("document_path"):
+        q = q.filter(DocumentRecord.document_path == selector["document_path"])
     if selector.get("revit_version"):
         q = q.filter(DocumentRecord.revit_version == selector["revit_version"])
     if selector.get("revit_instance_id"):
