@@ -21,11 +21,12 @@ LEASE_SEC = int(__import__('os').environ.get("COMMAND_LEASE_SEC", "300"))
 MAX_ATTEMPTS = int(os.environ.get("COMMAND_MAX_ATTEMPTS", "3"))
 MAX_ITEMS = int(os.environ.get("COMMAND_MAX_ITEMS", "5000"))
 MAX_PAYLOAD_BYTES = int(os.environ.get("COMMAND_MAX_PAYLOAD_BYTES", "5000000"))
-ALLOWED_SELECTOR_KEYS = {"document_id", "project_uid", "machine_id", "document_title", "document_path", "revit_version", "revit_instance_id", "revit_process_id", "session_id"}
+ALLOWED_SELECTOR_KEYS = {"agent_id", "document_id", "project_uid", "machine_id", "document_title", "document_path", "revit_version", "revit_instance_id", "revit_process_id", "session_id"}
 
 class CreateCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
     action: str = "place_mep_elements"
+    agent_id: str | None = None
     items: list = Field(default_factory=list)
     target_selector: dict = Field(default_factory=dict)
     idempotency_key: str | None = None
@@ -62,7 +63,7 @@ def _validate_create_request(body: CreateCommand):
     unknown = sorted(set(body.target_selector) - ALLOWED_SELECTOR_KEYS)
     if unknown:
         raise HTTPException(status_code=422, detail={"code": "unknown_target_selector_fields", "fields": unknown})
-    if not any(str(body.target_selector.get(k) or "").strip() for k in ("document_id", "revit_instance_id", "revit_process_id", "session_id", "machine_id", "project_uid", "document_path")):
+    if not any(str(body.target_selector.get(k) or "").strip() for k in ("agent_id", "document_id", "revit_instance_id", "revit_process_id", "session_id", "machine_id", "project_uid", "document_path")):
         raise HTTPException(status_code=422, detail="target_selector must contain at least one real identity field")
     if len(body.items) > MAX_ITEMS:
         raise HTTPException(status_code=413, detail="items exceeds COMMAND_MAX_ITEMS")
@@ -102,6 +103,12 @@ def create_command(body: CreateCommand, db: Session = Depends(get_db)):
     _expire_leases(db)
     if not body.items:
         raise HTTPException(status_code=422, detail="items must contain at least one work item")
+    if body.agent_id:
+        if not body.target_selector.get("agent_id"):
+            body.target_selector = dict(body.target_selector)
+            body.target_selector["agent_id"] = body.agent_id
+        elif str(body.target_selector.get("agent_id")) != str(body.agent_id):
+            raise HTTPException(status_code=422, detail="agent_id conflicts with target_selector.agent_id")
     _validate_create_request(body)
     request_hash = _request_fingerprint(body)
     if body.idempotency_key:
