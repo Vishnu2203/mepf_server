@@ -27,7 +27,7 @@ class RoutingError(Exception):
 
 def find_target_document(db: Session, selector: dict) -> DocumentRecord:
     """
-    selector may contain any of: document_id, project_uid, document_title,
+    selector may contain any of: agent_id, document_id, project_uid, document_title,
     document_path, machine_id, revit_version.
     Narrows the online document registry down using whichever fields are
     given. Raises RoutingError if zero or more-than-one match remains.
@@ -44,6 +44,8 @@ def find_target_document(db: Session, selector: dict) -> DocumentRecord:
     mark_stale_offline(db)
     q = db.query(DocumentRecord).filter(DocumentRecord.is_online.is_(True))
 
+    if selector.get("agent_id"):
+        q = q.join(SystemRecord, DocumentRecord.machine_id == SystemRecord.machine_id).filter(SystemRecord.agent_id == selector["agent_id"])
     if selector.get("document_id"):
         q = q.filter(DocumentRecord.document_id == selector["document_id"])
     if selector.get("project_uid"):
@@ -71,6 +73,7 @@ def find_target_document(db: Session, selector: dict) -> DocumentRecord:
         candidates = [
             {
                 "document_id": m.document_id,
+                "agent_id": db.get(SystemRecord, m.machine_id).agent_id if db.get(SystemRecord, m.machine_id) else None,
                 "machine_id": m.machine_id,
                 "project_uid": m.project_uid,
                 "document_title": m.document_title,
@@ -99,6 +102,8 @@ def resolve_candidates(db: Session, selector: dict) -> list:
     mark_stale_offline(db)
     q = db.query(DocumentRecord).filter(DocumentRecord.is_online.is_(True))
 
+    if selector.get("agent_id"):
+        q = q.join(SystemRecord, DocumentRecord.machine_id == SystemRecord.machine_id).filter(SystemRecord.agent_id == selector["agent_id"])
     if selector.get("document_id"):
         q = q.filter(DocumentRecord.document_id == selector["document_id"])
     if selector.get("project_uid"):
@@ -119,6 +124,7 @@ def resolve_candidates(db: Session, selector: dict) -> list:
     return [
         {
             "document_id": m.document_id,
+            "agent_id": db.get(SystemRecord, m.machine_id).agent_id if db.get(SystemRecord, m.machine_id) else None,
             "machine_id": m.machine_id,
             "project_uid": m.project_uid,
             "document_title": m.document_title,
@@ -138,7 +144,13 @@ def build_routing_block(doc_row: DocumentRecord) -> dict:
     project_uid, document_id, document_path, document_title, revit_version,
     machine_id, revit_process_id, session_id.
     """
+    system = None
+    try:
+        system = doc_row.system
+    except Exception:
+        system = None
     return {
+        "agent_id": system.agent_id if system else None,
         "machine_id": doc_row.machine_id,
         "revit_instance_id": doc_row.revit_instance_id,
         "revit_process_id": doc_row.revit_process_id,
