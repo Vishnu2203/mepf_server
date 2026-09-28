@@ -21,6 +21,7 @@ agent_registry.py / fetch_worker.py already send and expect:
 """
 import os
 import datetime as dt
+import uuid
 
 from sqlalchemy import (
     create_engine, Column, String, Integer, Boolean, DateTime, Text, ForeignKey, JSON, Index, inspect, text as sql_text
@@ -50,6 +51,7 @@ class SystemRecord(Base):
     __tablename__ = "systems"
 
     machine_id = Column(String, primary_key=True)   # workstation_id from agent's endpoint_config.json
+    agent_id = Column(String, unique=True, index=True, nullable=True)  # stable logical agent/system identity
     machine_name = Column(String, nullable=True)
     status = Column(String, default="online")        # online | offline
     last_seen = Column(DateTime, default=now, onupdate=now)
@@ -87,6 +89,7 @@ class ExtractionRecord(Base):
 
     extraction_id = Column(String, primary_key=True)
     machine_id = Column(String, index=True, nullable=True)
+    agent_id = Column(String, index=True, nullable=True)
     document_id = Column(String, index=True, nullable=True)
     project_uid = Column(String, index=True, nullable=True)
     payload = Column(JSON)
@@ -175,8 +178,10 @@ Index("ix_commands_lease", CommandRecord.status, CommandRecord.lease_expires_at)
 def _add_missing_columns():
     """Small additive migration for installations created by older builds."""
     inspector = inspect(engine)
+    existing_systems = set(c["name"] for c in inspector.get_columns("systems")) if "systems" in inspector.get_table_names() else set()
     existing = set(c["name"] for c in inspector.get_columns("commands")) if "commands" in inspector.get_table_names() else set()
     existing_idempotency = set(c["name"] for c in inspector.get_columns("idempotency_keys")) if "idempotency_keys" in inspector.get_table_names() else set()
+    existing_extractions = set(c["name"] for c in inspector.get_columns("extractions")) if "extractions" in inspector.get_table_names() else set()
     additions = {
         "status": "VARCHAR", "claimed_at": "TIMESTAMP", "execution_started_at": "TIMESTAMP",
         "completed_at": "TIMESTAMP", "lease_expires_at": "TIMESTAMP", "lease_token": "VARCHAR",
@@ -189,8 +194,12 @@ def _add_missing_columns():
         for name, typ in additions.items():
             if name not in existing:
                 conn.execute(sql_text("ALTER TABLE commands ADD COLUMN {} {}".format(name, typ)))
+        if "agent_id" not in existing_systems and existing_systems:
+            conn.execute(sql_text("ALTER TABLE systems ADD COLUMN agent_id VARCHAR"))
         if "request_hash" not in existing_idempotency and existing_idempotency:
             conn.execute(sql_text("ALTER TABLE idempotency_keys ADD COLUMN request_hash VARCHAR"))
+        if "agent_id" not in existing_extractions and existing_extractions:
+            conn.execute(sql_text("ALTER TABLE extractions ADD COLUMN agent_id VARCHAR"))
         # Normalize legacy states from the pre-lease build. A previously
         # delivered command had not been durably acknowledged by Revit, so it
         # is deliberately returned to PENDING instead of being marked done.
@@ -202,9 +211,21 @@ def _add_missing_columns():
         conn.execute(sql_text("UPDATE commands SET max_attempts=3 WHERE max_attempts IS NULL"))
 
 
+def _ensure_agent_ids():
+    """Assign a stable logical AGENT-* ID to legacy systems created before agent_id existed."""
+    db = SessionLocal()
+    try:
+        for row in db.query(SystemRecord).filter(SystemRecord.agent_id.is_(None)).all():
+            row.agent_id = "AGENT-{}".format(uuid.uuid4().hex[:12].upper())
+        db.commit()
+    finally:
+        db.close()
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
     _add_missing_columns()
+    _ensure_agent_ids()
 
 
 def get_db():
