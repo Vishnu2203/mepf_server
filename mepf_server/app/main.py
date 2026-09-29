@@ -22,13 +22,14 @@ from fastapi import FastAPI
 
 from app.models.db import init_db
 import os
-from app.routers import agents, project, commands
+from app.routers import agents, project, commands, ai
 
 app = FastAPI(title="MEPF Central Server + Orchestrator")
 
 app.include_router(agents.router)
 app.include_router(project.router)
 app.include_router(commands.router)
+app.include_router(ai.router)
 
 
 @app.on_event("startup")
