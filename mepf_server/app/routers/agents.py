@@ -136,31 +136,91 @@ def _upsert_system(db: Session, machine_id: str, agent_id: str, machine_name: st
     return sys_row
 
 
-def _upsert_documents(db: Session, machine_id: str, agent_instance_id: str, agent_session_id: str, documents: list):
-    """Upsert ONLY the documents owned by this Revit instance.
+def _norm_document_path(value):
+    """Normalize a Revit document path for physical-document comparisons."""
+    value = str(value or "").strip().replace("/", "\\")
+    while value.endswith("\\"):
+        value = value[:-1]
+    return value.lower()
 
-    A machine can run several Revit processes simultaneously. Therefore one
-    process heartbeat must never mark another process's documents offline.
+
+def _same_physical_document(row, machine_id, process_id, document_path, project_uid, document_title):
+    """Return True when a DB row represents the same live Revit document.
+
+    The process id is deliberately part of this key: the same RVT file can
+    legitimately be open in two separate Revit processes on one workstation.
+    """
+    if row.machine_id != machine_id or str(row.revit_process_id or "") != str(process_id or ""):
+        return False
+
+    incoming_path = _norm_document_path(document_path)
+    stored_path = _norm_document_path(row.document_path)
+    if incoming_path and stored_path:
+        return incoming_path == stored_path
+
+    # Unsaved documents have no stable path, so use the project identity plus
+    # title as a best-effort fallback within the same Revit process.
+    if project_uid and row.project_uid:
+        return str(row.project_uid).lower() == str(project_uid).lower() and (
+            not document_title or not row.document_title or
+            str(row.document_title) == str(document_title)
+        )
+    return False
+
+
+def _upsert_documents(db: Session, machine_id: str, agent_instance_id: str, agent_session_id: str, documents: list):
+    """Upsert documents for one Revit process and reconcile stale identities.
+
+    A machine can run several Revit processes simultaneously, so process id is
+    part of the physical-document key. If an old document_id/revit_instance_id
+    exists for the same machine + process + path, that old identity is marked
+    offline and the current heartbeat's document_id becomes the live record.
+    This prevents duplicate live projects after pyRevit reloads, agent updates,
+    or other identity changes while preserving support for multiple Revit
+    processes on the same machine.
     """
     instance_id = agent_instance_id or ""
     session_id = agent_session_id or ""
     seen_ids = set()
+
     for doc in documents or []:
-        document_id = doc.get("document_id")
+        document_id = str(doc.get("document_id") or "").strip()
         if not document_id:
             continue
-        seen_ids.add(document_id)
+
+        process_id = str(doc.get("revit_process_id") or "").strip()
+        document_path = doc.get("document_path")
+        project_uid = doc.get("project_uid")
+        document_title = doc.get("document_title")
+
+        # First look for the exact current identity.
         row = db.get(DocumentRecord, document_id)
+
+        # If the identity changed but the physical live document did not,
+        # retire the old row. Do NOT merge different Revit processes.
+        conflicts = db.query(DocumentRecord).filter(
+            DocumentRecord.machine_id == machine_id,
+            DocumentRecord.revit_process_id == process_id,
+            DocumentRecord.is_online.is_(True),
+        ).all()
+        for old_row in conflicts:
+            if old_row.document_id != document_id and _same_physical_document(
+                old_row, machine_id, process_id, document_path, project_uid, document_title
+            ):
+                old_row.is_online = False
+
         if row is None:
             row = DocumentRecord(document_id=document_id)
             db.add(row)
+
+        seen_ids.add(document_id)
         row.machine_id = machine_id
         row.revit_instance_id = doc.get("revit_instance_id") or instance_id
-        row.revit_process_id = doc.get("revit_process_id")
+        row.revit_process_id = process_id
         row.session_id = doc.get("session_id") or session_id
-        row.project_uid = doc.get("project_uid")
-        row.document_title = doc.get("document_title")
-        row.document_path = doc.get("document_path")
+        row.project_uid = project_uid
+        row.document_title = document_title
+        row.document_path = document_path
         row.revit_version = doc.get("revit_version")
         row.is_online = True
         row.last_seen = now()
