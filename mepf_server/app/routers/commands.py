@@ -20,6 +20,9 @@ router = APIRouter(prefix="/api/commands", tags=["commands"], dependencies=[Depe
 LEASE_SEC = int(__import__('os').environ.get("COMMAND_LEASE_SEC", "300"))
 MAX_ATTEMPTS = int(os.environ.get("COMMAND_MAX_ATTEMPTS", "3"))
 MAX_ITEMS = int(os.environ.get("COMMAND_MAX_ITEMS", "5000"))
+# A command nobody claimed within this window is cancelled instead of sitting in the
+# queue forever (e.g. its Revit session was closed; routing is pinned to session_id).
+PENDING_TTL_SEC = int(os.environ.get("COMMAND_PENDING_TTL_SEC", "1800"))
 MAX_PAYLOAD_BYTES = int(os.environ.get("COMMAND_MAX_PAYLOAD_BYTES", "5000000"))
 ALLOWED_SELECTOR_KEYS = {"agent_id", "document_id", "project_uid", "machine_id", "document_title", "document_path", "revit_version", "revit_instance_id", "revit_process_id", "session_id"}
 
@@ -42,6 +45,22 @@ class CommandResult(BaseModel):
 
 def _audit(db, command_id, event_type, actor, details=None):
     db.add(AuditEventRecord(command_id=command_id, event_type=event_type, actor=actor, details=details or {}))
+
+
+def _describe_failure(result: dict, status: str) -> str:
+    """Return the agent's real error instead of a generic message."""
+    if not isinstance(result, dict):
+        return "Agent reported {}".format(status.lower())
+    rerr = result.get("routing_error")
+    if isinstance(rerr, dict) and (rerr.get("code") or rerr.get("message")):
+        return "{}: {}".format(rerr.get("code") or "routing_error", rerr.get("message") or "")
+    for key in ("fatal_error", "error", "message"):
+        if result.get(key):
+            return str(result.get(key))
+    if status == "PARTIAL":
+        failed = [i for i in (result.get("items") or []) if isinstance(i, dict) and not i.get("ok")]
+        return "{} of {} items failed".format(result.get("failed", len(failed)), result.get("total", len(result.get("items") or [])))
+    return "Agent reported failure"
 
 
 def _request_fingerprint(body: CreateCommand) -> str:
@@ -83,18 +102,40 @@ def _expire_leases(db):
     ).all()
     changed = False
     for row in rows:
-        if (row.attempts or 0) >= (row.max_attempts or MAX_ATTEMPTS):
+        if row.status == "EXECUTING":
+            # The agent had already reported /start, i.e. Revit may have committed some or
+            # all elements. Re-queuing would execute the payload a second time and create
+            # duplicates, so the outcome is declared UNKNOWN (DEAD_LETTER) for a human /
+            # the payload manager's on_uncertain policy to decide.
             row.status = "DEAD_LETTER"
-            row.last_error = "Execution lease expired after maximum attempts."
+            row.last_error = "Lease expired while EXECUTING; outcome unknown (not re-queued to avoid duplicate elements)."
+            row.completed_at = current
+            _audit(db, row.command_id, "DEAD_LETTER_UNKNOWN_OUTCOME", row.lease_owner, {"attempts": row.attempts})
+        elif (row.attempts or 0) >= (row.max_attempts or MAX_ATTEMPTS):
+            row.status = "DEAD_LETTER"
+            row.last_error = "Claim lease expired after maximum attempts (never started)."
+            row.completed_at = current
             _audit(db, row.command_id, "DEAD_LETTER", row.lease_owner, {"attempts": row.attempts})
         else:
+            # CLAIMED but never started: nothing ran in Revit, safe to hand out again.
             row.status = "PENDING"
             row.lease_token = None
             row.lease_owner = None
             row.lease_expires_at = None
-            row.last_error = "Execution lease expired; command returned to queue."
+            row.last_error = "Claim lease expired before start; command returned to queue."
             _audit(db, row.command_id, "LEASE_EXPIRED_REQUEUED", None, {"attempts": row.attempts})
         changed = True
+    if PENDING_TTL_SEC > 0:
+        stale = db.query(CommandRecord).filter(
+            CommandRecord.status == "PENDING",
+            CommandRecord.created_at < current - dt.timedelta(seconds=PENDING_TTL_SEC),
+        ).all()
+        for row in stale:
+            row.status = "CANCELLED"
+            row.completed_at = current
+            row.last_error = "Expired: not claimed by any agent within {}s.".format(PENDING_TTL_SEC)
+            _audit(db, row.command_id, "PENDING_EXPIRED", None, {})
+            changed = True
     if changed:
         db.commit()
 
@@ -126,7 +167,8 @@ def create_command(body: CreateCommand, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail={"code": ex.code, "message": ex.message, "candidates": ex.candidates})
     command_id = "CMD-{0}".format(uuid.uuid4())
     routing = build_routing_block(doc_row)
-    row = CommandRecord(command_id=command_id, machine_id=doc_row.machine_id, routing=routing, action=body.action, items=body.items, status="PENDING", max_attempts=body.max_attempts)
+    row = CommandRecord(command_id=command_id, machine_id=doc_row.machine_id, routing=routing, action=body.action, items=body.items, status="PENDING", max_attempts=body.max_attempts,
+                        target_process_id=str(routing.get("revit_process_id") or ""), target_session_id=str(routing.get("session_id") or ""))
     db.add(row)
     if body.idempotency_key:
         db.add(IdempotencyRecord(key=body.idempotency_key, command_id=command_id, request_hash=request_hash))
@@ -154,6 +196,8 @@ def next_command(machine_id: str = Query(default=""), revit_process_id: str = Qu
     owner = "{}:{}:{}".format(machine_id, revit_process_id, session_id)
     candidates = (db.query(CommandRecord)
                   .filter(CommandRecord.machine_id == machine_id, CommandRecord.status == "PENDING")
+                  .filter((CommandRecord.target_process_id == str(revit_process_id)) | CommandRecord.target_process_id.is_(None))
+                  .filter((CommandRecord.target_session_id == str(session_id)) | CommandRecord.target_session_id.is_(None))
                   .order_by(CommandRecord.created_at.asc())
                   .with_for_update(skip_locked=True)
                   .limit(20).all())
@@ -221,7 +265,7 @@ def post_result(command_id: str, body: CommandResult, db: Session = Depends(get_
     cmd.completed_at = now()
     cmd.status = {"SUCCESS":"SUCCEEDED", "PARTIAL":"PARTIAL", "FAILED":"FAILED"}[status]
     cmd.lease_expires_at = None
-    cmd.last_error = None if status in ("SUCCESS", "PARTIAL") else str((body.result or {}).get("error") or "Agent reported failure")
+    cmd.last_error = None if status == "SUCCESS" else _describe_failure(body.result or {}, status)
     db.add(CommandResultRecord(command_id=command_id, status=status, routing=supplied, result=body.result or {}))
     _audit(db, command_id, "RESULT_" + status, body.lease_owner or cmd.lease_owner, {"attempts": cmd.attempts})
     db.commit()
@@ -260,4 +304,4 @@ def command_detail(command_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Unknown command_id")
     results = db.query(CommandResultRecord).filter(CommandResultRecord.command_id == command_id).order_by(CommandResultRecord.received_at.desc()).all()
     events = db.query(AuditEventRecord).filter(AuditEventRecord.command_id == command_id).order_by(AuditEventRecord.created_at.asc()).all()
-    return {"command_id":row.command_id,"status":row.status,"machine_id":row.machine_id,"routing":row.routing,"action":row.action,"attempts":row.attempts,"max_attempts":row.max_attempts,"created_at":row.created_at.isoformat() if row.created_at else None,"delivered_at":row.delivered_at.isoformat() if row.delivered_at else None,"execution_started_at":row.execution_started_at.isoformat() if row.execution_started_at else None,"completed_at":row.completed_at.isoformat() if row.completed_at else None,"last_error":row.last_error,"lease_owner":row.lease_owner,"lease_expires_at":row.lease_expires_at.isoformat() if row.lease_expires_at else None,"results":[{"status":r.status,"result":r.result,"received_at":r.received_at.isoformat()} for r in results],"audit":[{"event_type":e.event_type,"actor":e.actor,"details":e.details,"created_at":e.created_at.isoformat()} for e in events]}
+    return {"command_id":row.command_id,"status":row.status,"command_status":row.status,"machine_id":row.machine_id,"routing":row.routing,"action":row.action,"attempts":row.attempts,"max_attempts":row.max_attempts,"created_at":row.created_at.isoformat() if row.created_at else None,"delivered_at":row.delivered_at.isoformat() if row.delivered_at else None,"execution_started_at":row.execution_started_at.isoformat() if row.execution_started_at else None,"completed_at":row.completed_at.isoformat() if row.completed_at else None,"last_error":row.last_error,"lease_owner":row.lease_owner,"lease_expires_at":row.lease_expires_at.isoformat() if row.lease_expires_at else None,"results":[{"status":r.status,"result":r.result,"received_at":r.received_at.isoformat()} for r in results],"audit":[{"event_type":e.event_type,"actor":e.actor,"details":e.details,"created_at":e.created_at.isoformat()} for e in events]}
