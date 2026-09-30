@@ -138,6 +138,12 @@ class CommandRecord(Base):
     max_attempts = Column(Integer, default=3, nullable=False)
     last_error = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=now, onupdate=now)
+    # Denormalised copy of routing.revit_process_id / routing.session_id so that
+    # GET /next can filter in SQL. Without this the claim query only looked at the
+    # 20 oldest PENDING rows of the machine and skipped foreign-process rows in
+    # Python, which starved a Revit process whose commands sat behind another's.
+    target_process_id = Column(String, nullable=True, index=True)
+    target_session_id = Column(String, nullable=True, index=True)
 
 
 class CommandResultRecord(Base):
@@ -171,6 +177,55 @@ class IdempotencyRecord(Base):
     created_at = Column(DateTime, default=now)
 
 
+# ============================================================
+# PAYLOADS  (server-side payload folder -> routed command)
+# ============================================================
+class PayloadRecord(Base):
+    __tablename__ = "payloads"
+
+    payload_id = Column(String, primary_key=True)            # PLD-<uuid>
+    logical_id = Column(String, index=True)                  # "payload_id" inside the file, else file stem
+    file_name = Column(String, index=True)                   # relative to inbox/
+    sha256 = Column(String, index=True)                      # hash of canonical JSON content
+    status = Column(String, index=True, default="DISCOVERED")
+    error_code = Column(String, nullable=True)
+    last_error = Column(Text, nullable=True)
+    action = Column(String, default="place_mep_elements")
+    priority = Column(Integer, default=100)                  # higher first
+    depends_on = Column(JSON, nullable=True)                 # list of logical_ids that must be SUCCEEDED
+    on_uncertain = Column(String, default="hold")            # hold | retry  (outcome unknown after timeout)
+    item_count = Column(Integer, default=0)
+    body = Column(JSON, nullable=True)                       # normalised {"items": [...]} - DB is self-sufficient
+    target_spec = Column(JSON, nullable=True)                # resolved selector
+    target_source = Column(String, nullable=True)            # payload.selector | payload.alias | file_rule
+    candidates = Column(JSON, nullable=True)                 # filled when AMBIGUOUS_TARGET / NO_TARGET
+    selected_document_id = Column(String, index=True, nullable=True)
+    selected_agent_id = Column(String, nullable=True)
+    selected_machine_id = Column(String, nullable=True)
+    selected_instance_id = Column(String, nullable=True)
+    selected_process_id = Column(String, nullable=True)
+    selected_session_id = Column(String, nullable=True)
+    command_id = Column(String, index=True, nullable=True)
+    attempts = Column(Integer, default=0, nullable=False)
+    max_attempts = Column(Integer, default=3, nullable=False)
+    next_attempt_at = Column(DateTime, nullable=True)
+    result_summary = Column(JSON, nullable=True)
+    discovered_at = Column(DateTime, default=now, index=True)
+    queued_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=now, onupdate=now)
+
+
+class PayloadEventRecord(Base):
+    __tablename__ = "payload_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    payload_id = Column(String, index=True)
+    event = Column(String, index=True)
+    details = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=now, index=True)
+
+
 Index("ix_commands_claimable", CommandRecord.machine_id, CommandRecord.status, CommandRecord.created_at)
 Index("ix_commands_lease", CommandRecord.status, CommandRecord.lease_expires_at)
 
@@ -187,6 +242,7 @@ def _add_missing_columns():
         "completed_at": "TIMESTAMP", "lease_expires_at": "TIMESTAMP", "lease_token": "VARCHAR",
         "lease_owner": "VARCHAR", "attempts": "INTEGER DEFAULT 0", "max_attempts": "INTEGER DEFAULT 3",
         "last_error": "TEXT", "updated_at": "TIMESTAMP",
+        "target_process_id": "VARCHAR", "target_session_id": "VARCHAR",
     }
     if not existing:
         return
