@@ -286,5 +286,35 @@ with TestClient(app) as c:
     check(status_of(c, "n") == "QUEUED" and one(c, "n")["selected"]["machine_id"] == "8453725f-uuid", "machine_name resolved to the machine_id")
     check(status_of(c, "n2") == "NO_TARGET", "wrong machine_name never falls back to another machine")
 
+print("\n[T18] legacy FamilyExtract ingest-auto also triggers a payload-router pass")
+with TestClient(app) as c:
+    reset()
+    a = Agent(c, "PC1", 1, [("DOC-1", "UID-1", "M1", r"C:\\1.rvt")]); a.beat()
+    drop("waiting.json", GOOD())
+    ingest = {
+        "meta": {
+            "agent_id": a.agent_id,
+            "machine_id": a.machine,
+            "document_id": "DOC-1",
+            "revit_instance_id": "INST-PC1-1",
+            "revit_process_id": a.pid,
+            "session_id": a.sess,
+        },
+        "project": {
+            "project_uid": "UID-1",
+            "document_path": r"C:\\1.rvt",
+            "document_title": "M1",
+        },
+        "buildings": [],
+        "summary": {},
+    }
+    r = c.post("/api/project/ingest-auto", headers=H, json=ingest)
+    check(r.status_code == 200 and r.json()["status"] == "received", "ingest-auto remains successful")
+    check(r.json()["matched_document_id"] == "DOC-1", "ingest-auto matches the live Revit document")
+    check(r.json()["payload_router"]["routed"] == 1, "ingest-auto triggers one payload-router pass")
+    check(status_of(c, "waiting") == "QUEUED", "waiting inbox payload is queued after ingest-auto")
+    cmd = a.poll()
+    check(cmd is not None and cmd["routing"]["document_id"] == "DOC-1", "the newly registered Revit document receives the waiting payload")
+
 print("\nALL %d CHECKS PASSED" % len(PASS))
 shutil.rmtree(TMP, ignore_errors=True)
