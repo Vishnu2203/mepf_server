@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from app.models.db import get_db, ExtractionRecord, DocumentRecord, SystemRecord
+from app.orchestrator import payload_manager
 
 router = APIRouter(prefix="/api/project", tags=["project"], dependencies=[Depends(require_api_key)])
 
@@ -117,4 +118,24 @@ def ingest_auto(body: dict, db: Session = Depends(get_db)):
     db.add(row)
     db.commit()
 
-    return {"status": "received", "extraction_id": extraction_id, "matched_document_id": doc_row.document_id if doc_row else None, "agent_id": agent_id or (db.get(SystemRecord, doc_row.machine_id).agent_id if doc_row and db.get(SystemRecord, doc_row.machine_id) else None)}
+    # Bridge the legacy FamilyExtract ingestion path with the server-side
+    # payload inbox.  Ingestion itself remains an extraction-record operation;
+    # we do NOT turn the large extraction body into a Revit command.  Instead,
+    # once the current Revit document has been confirmed online, immediately
+    # run one payload-router pass so any JSON already waiting in payloads/inbox
+    # can be selected for this live document.  The background watcher remains
+    # the normal retry mechanism.
+    try:
+        payload_scan = payload_manager.tick()
+    except Exception as exc:
+        # The extraction was already committed successfully. Do not turn a
+        # transient payload-router problem into a false ingestion failure.
+        payload_scan = {"error": str(exc)[:500]}
+
+    return {
+        "status": "received",
+        "extraction_id": extraction_id,
+        "matched_document_id": doc_row.document_id if doc_row else None,
+        "agent_id": agent_id or (db.get(SystemRecord, doc_row.machine_id).agent_id if doc_row and db.get(SystemRecord, doc_row.machine_id) else None),
+        "payload_router": payload_scan,
+    }
