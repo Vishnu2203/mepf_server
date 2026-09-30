@@ -40,6 +40,7 @@ import uuid
 
 from fastapi import HTTPException
 from sqlalchemy import text as sql_text
+from pathlib import Path
 
 from app.models.db import (
     SessionLocal, engine, PayloadRecord, PayloadEventRecord, CommandRecord,
@@ -49,11 +50,15 @@ from app.orchestrator.routing_engine import resolve_candidates
 from app.routers.commands import CreateCommand, create_command, ALLOWED_SELECTOR_KEYS, MAX_ITEMS, _expire_leases
 
 log = logging.getLogger("payload_manager")
+APP_ROOT = Path(__file__).resolve().parents[2]
 
 # ----------------------------------------------------------------------------
 # configuration (all env-overridable)
 # ----------------------------------------------------------------------------
-PAYLOAD_DIR = os.environ.get("MEPF_PAYLOAD_DIR", os.path.join(os.getcwd(), "payloads"))
+PAYLOAD_DIR = os.environ.get(
+    "MEPF_PAYLOAD_DIR",
+    str(APP_ROOT / "payloads")
+)
 SCAN_SEC = float(os.environ.get("MEPF_PAYLOAD_SCAN_SEC", "5"))
 SETTLE_SEC = float(os.environ.get("MEPF_PAYLOAD_SETTLE_SEC", "2"))          # file must be unchanged this long
 PARTIAL_WRITE_GRACE_SEC = float(os.environ.get("MEPF_PAYLOAD_PARSE_GRACE_SEC", "15"))
