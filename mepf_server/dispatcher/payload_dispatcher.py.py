@@ -61,7 +61,7 @@ SERVER_URL = os.getenv(
 API_KEY = os.getenv("MEPF_API_KEY", "")
 
 # Example on a Windows server:
-INBOX_DIR = Path(os.getenv("MEPF_PAYLOAD_INBOX", r"C:\MEPF\payloads\inbox"))
+INBOX_DIR = Path(os.getenv("MEPF_PAYLOAD_INBOX","/tmp/mepf_payloads/inbox") )
 
 # The dispatcher creates these automatically.
 PROCESSING_DIR = INBOX_DIR.parent / "processing"
