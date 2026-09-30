@@ -196,7 +196,11 @@ def resolve_target_spec(body, file_name):
             sel = rmap["aliases"].get(str(rule.get("alias") or ""))
             if isinstance(sel, dict):
                 return _clean_selector(sel), "file_rule"
-    return None, "no_target_information"
+    # No target information is allowed: the router will apply the deterministic
+    # automatic selection policy in route_waiting().  Keeping this as a distinct
+    # source lets the API show that the machine was selected by policy rather than
+    # by a caller-supplied selector.
+    return {}, "automatic"
 
 
 # ----------------------------------------------------------------------------
@@ -404,6 +408,52 @@ def _doc_busy(db, document_id, exclude_payload_id):
     ).first() is not None
 
 
+def _candidate_load(db, document_id):
+    """Return the current deterministic load for one live Revit document.
+
+    The load includes both payload-router work and legacy commands already
+    pinned to the same document.  This is deliberately a count, not a random
+    or time-based choice, so the same registry state produces the same winner.
+    """
+    payload_load = db.query(PayloadRecord).filter(
+        PayloadRecord.selected_document_id == document_id,
+        PayloadRecord.status.in_(list(INFLIGHT | {"TARGET_SELECTED"})),
+    ).count()
+    command_rows = db.query(CommandRecord).filter(
+        CommandRecord.status.in_(["PENDING", "CLAIMED", "EXECUTING"])
+    ).all()
+    command_load = sum(1 for row in command_rows
+                       if str((row.routing or {}).get("document_id") or "") == str(document_id))
+    return payload_load + command_load
+
+
+def _choose_candidate(db, candidates):
+    """Choose one candidate using a documented, deterministic policy.
+
+    Priority:
+      1. do not select a document that is already busy when another candidate
+         is free;
+      2. lowest active workload;
+      3. stable identity tie-breakers (machine_id, process/session, document_id).
+
+    No random choice and no dependence on database row order.
+    """
+    if not candidates:
+        return None
+    free = [c for c in candidates if not _doc_busy(db, c["document_id"], "")]
+    pool = free or candidates
+    scored = []
+    for c in pool:
+        scored.append((_candidate_load(db, c["document_id"]),
+                       str(c.get("machine_id") or ""),
+                       str(c.get("revit_process_id") or ""),
+                       str(c.get("session_id") or ""),
+                       str(c.get("revit_instance_id") or ""),
+                       str(c.get("document_id") or ""), c))
+    scored.sort(key=lambda x: x[:-1])
+    return scored[0][-1]
+
+
 def _deps_state(db, p):
     """'ok' | 'wait' | ('failed', dep)"""
     for dep in (p.depends_on or []):
@@ -436,17 +486,19 @@ def route_waiting(db):
             continue
 
         spec, source = resolve_target_spec(p.body or {}, p.file_name)      # cheap; map is cached by mtime
-        if not spec:
-            _mark_waiting(db, p, prior, "NO_TARGET", "no_target_information",
-                          "payload has no target block, alias, or matching file rule ({})".format(source), [])
-            continue
+        # An empty selector means automatic routing.  Explicit selectors are
+        # still honoured, but if they match multiple live documents the same
+        # deterministic workload/tie-break policy is used instead of guessing
+        # from database order.
+        if spec is None:
+            spec = {}
         if spec != p.target_spec or source != p.target_source:
             p.target_spec, p.target_source = spec, source
             db.commit()
 
         strong = {"agent_id", "document_id", "revit_instance_id", "revit_process_id", "session_id", "machine_id", "machine_name", "project_uid", "document_path"}
         bad = sorted(set(spec) - ALLOWED_SELECTOR_KEYS - LOCAL_SELECTOR_KEYS)
-        if bad or not (set(spec) & strong):
+        if bad or (spec and not (set(spec) & strong)):
             if _cas(db, p, {prior}, status="INVALID", error_code="bad_selector", completed_at=cur,
                     last_error="selector unusable (unknown keys {} or no identity field): {}".format(bad, spec)):
                 _event(db, p.payload_id, "INVALID", {"selector": spec})
@@ -461,14 +513,15 @@ def route_waiting(db):
                 continue
             _mark_waiting(db, p, prior, "NO_TARGET", "no_target_online", "no online document matches {}".format(spec), [])
             continue
-        if len(cands) > 1:
-            _mark_waiting(db, p, prior, "AMBIGUOUS_TARGET", "ambiguous_target",
-                          "{} online documents match {}; add agent_id / machine_id / document_id".format(len(cands), spec), cands)
+        # Deterministic automatic selection.  For an exact document_id this
+        # normally yields one candidate.  For broader selectors (including a
+        # shared project_uid) or no selector at all, select the least-loaded
+        # free live document, then stable machine/process/session/document IDs.
+        doc = _choose_candidate(db, cands)
+        if doc is None:
             continue
-
-        doc = cands[0]
         if _doc_busy(db, doc["document_id"], p.payload_id):
-            continue                                              # per-document serialisation: wait for the running payload
+            continue
         if not _cas(db, p, {prior}, status="TARGET_SELECTED", selected_document_id=doc["document_id"],
                     selected_agent_id=doc["agent_id"], selected_machine_id=doc["machine_id"],
                     selected_process_id=doc.get("revit_process_id"), selected_session_id=doc.get("session_id"),
@@ -706,12 +759,15 @@ def preview(db, body, file_name="preview.json"):
         return {"valid": False, "errors": errors, "warnings": warnings}
     spec, source = resolve_target_spec(body_n, file_name)
     out = {"valid": True, "warnings": warnings, "target_source": source, "selector": spec, "item_count": len(body_n["items"])}
-    if spec:
-        c = _online_candidates(db, spec)
-        out["candidates"] = c
-        out["outcome"] = "TARGET_SELECTED" if len(c) == 1 else ("NO_TARGET" if not c else "AMBIGUOUS_TARGET")
-    else:
+    c = _online_candidates(db, spec or {})
+    out["candidates"] = c
+    if not c:
         out["outcome"] = "NO_TARGET"
+    else:
+        chosen = _choose_candidate(db, c)
+        out["selected"] = chosen
+        out["selection_policy"] = "least_active_workload_then_machine_id_then_process_id_then_session_id_then_instance_id_then_document_id"
+        out["outcome"] = "TARGET_SELECTED"
     return out
 
 
