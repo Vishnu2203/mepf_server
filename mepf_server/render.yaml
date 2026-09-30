@@ -3,12 +3,10 @@ services:
     name: multiple-system-payload-send
     env: python
     plan: free
-
-    # Use this only if app/, payloads/, requirements.txt,
-    # and render.yaml are inside the mepf_server folder.
     rootDir: mepf_server
 
     buildCommand: pip install -r requirements.txt
+
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
     envVars:
@@ -20,12 +18,6 @@ services:
       - key: MEPF_API_KEY
         sync: false
 
-      # Payload files are located at:
-      # mepf_server/payloads/inbox/
-      - key: MEPF_PAYLOAD_DIR
-        value: ./payloads
-
-      # Keep the automatic payload watcher enabled
       - key: MEPF_PAYLOAD_WATCHER
         value: "1"
 
