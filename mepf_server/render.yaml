@@ -1,26 +1,48 @@
 services:
+  # ============================================================
+  # 1. FASTAPI WEB SERVICE
+  # ============================================================
   - type: web
-    name: multiple-system-payload-send
-    env: python
+    name: mepf-server
+    runtime: python
     plan: free
-    rootDir: mepf_server
 
     buildCommand: pip install -r requirements.txt
 
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
     envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: mepf-postgres
-          property: connectionString
+      - key: MEPF_SERVER_URL
+        value: https://mepf-server.onrender.com
 
       - key: MEPF_API_KEY
         sync: false
 
-      - key: MEPF_PAYLOAD_WATCHER
+      - key: PYTHONUNBUFFERED
         value: "1"
 
-databases:
-  - name: mepf-postgres
+
+  # ============================================================
+  # 2. PAYLOAD DISPATCHER BACKGROUND WORKER
+  # ============================================================
+  - type: worker
+    name: mepf-payload-dispatcher
+    runtime: python
     plan: free
+
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: python -m dispatcher.payload_dispatcher
+
+    envVars:
+      - key: MEPF_SERVER_URL
+        value: https://mepf-server.onrender.com
+
+      - key: MEPF_API_KEY
+        sync: false
+
+      - key: MEPF_PAYLOAD_INBOX
+        value: /opt/render/project/src/payloads/inbox
+
+      - key: PYTHONUNBUFFERED
+        value: "1"
