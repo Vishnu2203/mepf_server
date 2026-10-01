@@ -501,7 +501,16 @@ def route_waiting(db):
             p.target_spec, p.target_source = spec, source
             db.commit()
 
-        strong = {"agent_id", "document_id", "revit_instance_id", "revit_process_id", "session_id", "machine_id", "machine_name", "project_uid", "document_path"}
+        # A filename rule may resolve to a document title + Revit version when
+        # no stable document_id is embedded in the placement JSON.  These are
+        # still document-level identity fields and must count as a usable
+        # selector; otherwise a valid file rule is incorrectly rejected as
+        # "no identity field" before routing.
+        strong = {
+            "agent_id", "document_id", "revit_instance_id", "revit_process_id",
+            "session_id", "machine_id", "machine_name", "project_uid",
+            "document_path", "document_title", "revit_version",
+        }
         bad = sorted(set(spec) - ALLOWED_SELECTOR_KEYS - LOCAL_SELECTOR_KEYS)
         if bad or (spec and not (set(spec) & strong)):
             if _cas(db, p, {prior}, status="INVALID", error_code="bad_selector", completed_at=cur,
@@ -850,6 +859,7 @@ def start_background():
     if _thread is not None and _thread.is_alive():
         return
     ensure_dirs()
+    log.info("payload watcher started; inbox=%s", _inbox())
 
     def loop():
         while True:
