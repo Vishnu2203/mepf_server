@@ -17,3 +17,26 @@ services:
 
       - key: PYTHONUNBUFFERED
         value: "1"
+
+
+  - type: worker
+    name: mepf-payload-dispatcher
+    runtime: python
+    plan: free
+
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: python -m dispatcher.payload_dispatcher
+
+    envVars:
+      - key: MEPF_SERVER_URL
+        value: https://mepf-server.onrender.com
+
+      - key: MEPF_API_KEY
+        sync: false
+
+      - key: MEPF_PAYLOAD_INBOX
+        value: /opt/render/project/src/payloads/inbox
+
+      - key: PYTHONUNBUFFERED
+        value: "1"
