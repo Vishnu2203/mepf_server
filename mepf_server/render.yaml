@@ -1,4 +1,7 @@
 services:
+  # ============================================================
+  # FASTAPI WEB SERVICE
+  # ============================================================
   - type: web
     name: mepf-server
     runtime: python
@@ -19,6 +22,9 @@ services:
         value: "1"
 
 
+  # ============================================================
+  # PAYLOAD DISPATCHER BACKGROUND WORKER
+  # ============================================================
   - type: worker
     name: mepf-payload-dispatcher
     runtime: python
@@ -37,6 +43,21 @@ services:
 
       - key: MEPF_PAYLOAD_INBOX
         value: /opt/render/project/src/payloads/inbox
+
+      - key: MEPF_PAYLOAD_PROCESSING
+        value: /opt/render/project/src/payloads/processing
+
+      - key: MEPF_PAYLOAD_SUCCEEDED
+        value: /opt/render/project/src/payloads/succeeded
+
+      - key: MEPF_PAYLOAD_FAILED
+        value: /opt/render/project/src/payloads/failed
+
+      - key: MEPF_PAYLOAD_AMBIGUOUS
+        value: /opt/render/project/src/payloads/ambiguous
+
+      - key: MEPF_PAYLOAD_INVALID
+        value: /opt/render/project/src/payloads/invalid
 
       - key: PYTHONUNBUFFERED
         value: "1"
