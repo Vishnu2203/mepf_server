@@ -1,394 +1,184 @@
 # -*- coding: utf-8 -*-
 """
-agents.py
-=============================================================================
-Implements:  POST /api/agents/register
-             POST /api/agents/heartbeat
-             GET  /api/agents/list
+/api/payloads  -  operator API for the server-side payload folder.
 
-These are called every 30s by agent_registry.py on every Local Agent
-(pyRevit extension). This is the "System Registry" + "Document Registry" 
-in your diagram — built dynamically, exactly as you decided:
-  Local Agent starts -> auto-registers itself + every open document.
-
-Body shape sent by agent_registry.py's _body():
-{
-  "machine_id": "...",
-  "revit_process_id": "...",
-  "session_id": "...",
-  "timestamp": "...",
-  "documents": [
-     {  # from routing_identity.document_descriptor()
-       "machine_id", "machine_name", "revit_version", "revit_build",
-       "revit_process_id", "revit_instance_id", "project_uid",
-       "document_id", "document_path", "document_title", "session_id"
-     }, ...
-  ]
-}
-
-/list behavior (fix applied):
-  A machine only appears in /api/agents/list while its agent is actively
-  sending heartbeats (every 30s). If a machine hasn't been heard from in
-  OFFLINE_THRESHOLD_SEC (i.e. Revit was closed / agent stopped on THAT
-  machine), it is dropped from the list. Other machines that are still
-  sending heartbeats are completely unaffected.
-=============================================================================
+  GET  /api/payloads                      list (filter: ?status=&limit=)
+  GET  /api/payloads/routing-map          the alias / file-rule map currently in force
+  POST /api/payloads/upload               write a payload into inbox/ (for hosts with no shell access, e.g. Render)
+  POST /api/payloads/preview              dry-run: validate + show which document would be selected. Creates nothing.
+  POST /api/payloads/scan                 run one watcher pass now
+  GET  /api/payloads/{payload_id}         full record + event history + command detail
+  POST /api/payloads/{payload_id}/retry   re-queue (force=true needed when elements may already exist)
+  POST /api/payloads/{payload_id}/cancel  cancel if not yet claimed by an agent
 """
-import datetime as dt
+import os
+import json
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
-from app.models.db import get_db, SystemRecord, DocumentRecord, now
-import uuid
 from app.auth import require_api_key
+from app.models.db import get_db, PayloadRecord, PayloadEventRecord, CommandRecord, SessionLocal
+from app.orchestrator import payload_manager as pm
 
-router = APIRouter(prefix="/api/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
-
-# Agent sends a heartbeat every 30s (see agent_registry.py / config
-# heartbeat_interval_sec). If a machine hasn't been heard from within this
-# many seconds, treat it as "Revit closed / agent stopped" for that
-# specific machine and drop it from /list. 3x the heartbeat interval gives
-# a small buffer for one missed beat or a slow request, without other
-# online machines being affected.
-OFFLINE_THRESHOLD_SEC = 90
+router = APIRouter(prefix="/api/payloads", tags=["payloads"], dependencies=[Depends(require_api_key)])
 
 
-def mark_stale_offline(db: Session):
-    """
-    Shared staleness sweep so every consumer of "is this document really
-    online" (this router's /list AND the routing engine's target matching)
-    agree on the same definition. A document/system whose agent stopped
-    heartbeating (crashed, network/import error, Revit closed) more than
-    OFFLINE_THRESHOLD_SEC ago is flipped to is_online/status=offline here,
-    instead of relying only on the *next* successful heartbeat to notice
-    it disappeared - which never happens if the agent can no longer talk
-    to the server at all.
-    """
-    cutoff = now() - dt.timedelta(seconds=OFFLINE_THRESHOLD_SEC)
-    stale_docs = (
-        db.query(DocumentRecord)
-        .filter(DocumentRecord.is_online.is_(True), DocumentRecord.last_seen < cutoff)
-        .all()
-    )
-    for row in stale_docs:
-        row.is_online = False
-
-    stale_systems = (
-        db.query(SystemRecord)
-        .filter(SystemRecord.status == "online", SystemRecord.last_seen < cutoff)
-        .all()
-    )
-    for row in stale_systems:
-        row.status = "offline"
-
-    if stale_docs or stale_systems:
-        db.commit()
-
-
-def _validate_agent_identity(body: dict, x_workstation_id: str):
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=422, detail="agent body must be a JSON object")
-    machine_id = str(body.get("machine_id") or "").strip()
-    agent_id = str(body.get("agent_id") or "").strip()
-    process_id = str(body.get("revit_process_id") or "").strip()
-    session_id = str(body.get("session_id") or "").strip()
-    documents = body.get("documents")
-    if not machine_id or not process_id or not session_id:
-        raise HTTPException(status_code=422, detail="machine_id, revit_process_id and session_id are required")
-    if not x_workstation_id:
-        raise HTTPException(status_code=401, detail="X-Workstation-Id is required for agent registration")
-    if x_workstation_id != machine_id:
-        raise HTTPException(status_code=401, detail="X-Workstation-Id does not match machine_id")
-    if not isinstance(documents, list):
-        raise HTTPException(status_code=422, detail="documents must be a list")
-    for i, doc in enumerate(documents):
-        if not isinstance(doc, dict):
-            raise HTTPException(status_code=422, detail="documents[{}] must be an object".format(i))
-        for key in ("document_id", "revit_instance_id", "revit_process_id", "session_id"):
-            if not str(doc.get(key) or "").strip():
-                raise HTTPException(status_code=422, detail="documents[{}].{} is required".format(i, key))
-        if str(doc.get("revit_process_id")) != process_id or str(doc.get("session_id")) != session_id:
-            raise HTTPException(status_code=422, detail="document identity does not match the registering Revit process/session")
-
-
-def _upsert_system(db: Session, machine_id: str, agent_id: str, machine_name: str, status: str):
-    sys_row = db.get(SystemRecord, machine_id)
-    if sys_row is None:
-        sys_row = SystemRecord(machine_id=machine_id, agent_id=agent_id or "AGENT-{}".format(uuid.uuid4().hex[:12].upper()), machine_name=machine_name, status=status)
-        db.add(sys_row)
-    else:
-        if agent_id:
-            owner = db.query(SystemRecord).filter(
-                SystemRecord.agent_id == agent_id,
-                SystemRecord.machine_id != machine_id,
-            ).first()
-            if owner:
-                raise HTTPException(status_code=409, detail="agent_id is already registered to another machine")
-            # The agent owns its stable ID in endpoint_config.json. Allow an
-            # existing server row to adopt that ID during an upgrade (older
-            # servers may have generated a temporary AGENT-* value), but never
-            # allow the same agent_id to move to another machine.
-            sys_row.agent_id = agent_id
-        sys_row.machine_name = machine_name or sys_row.machine_name
-        sys_row.status = status
-        sys_row.last_seen = now()
-    return sys_row
-
-
-def _norm_document_path(value):
-    """Normalize a Revit document path for physical-document comparisons."""
-    value = str(value or "").strip().replace("/", "\\")
-    while value.endswith("\\"):
-        value = value[:-1]
-    return value.lower()
-
-
-def _same_physical_document(row, machine_id, process_id, document_path, project_uid, document_title):
-    """Return True when a DB row represents the same live Revit document.
-
-    The process id is deliberately part of this key: the same RVT file can
-    legitimately be open in two separate Revit processes on one workstation.
-    """
-    if row.machine_id != machine_id or str(row.revit_process_id or "") != str(process_id or ""):
-        return False
-
-    incoming_path = _norm_document_path(document_path)
-    stored_path = _norm_document_path(row.document_path)
-    if incoming_path and stored_path:
-        return incoming_path == stored_path
-
-    # Unsaved documents have no stable path, so use the project identity plus
-    # title as a best-effort fallback within the same Revit process.
-    if project_uid and row.project_uid:
-        return str(row.project_uid).lower() == str(project_uid).lower() and (
-            not document_title or not row.document_title or
-            str(row.document_title) == str(document_title)
-        )
-    return False
-
-
-def _upsert_documents(db: Session, machine_id: str, agent_instance_id: str, agent_session_id: str, documents: list):
-    """Upsert documents for one Revit process and reconcile stale identities.
-
-    A machine can run several Revit processes simultaneously, so process id is
-    part of the physical-document key. If an old document_id/revit_instance_id
-    exists for the same machine + process + path, that old identity is marked
-    offline and the current heartbeat's document_id becomes the live record.
-    This prevents duplicate live projects after pyRevit reloads, agent updates,
-    or other identity changes while preserving support for multiple Revit
-    processes on the same machine.
-    """
-    instance_id = agent_instance_id or ""
-    session_id = agent_session_id or ""
-    seen_ids = set()
-
-    for doc in documents or []:
-        document_id = str(doc.get("document_id") or "").strip()
-        if not document_id:
-            continue
-
-        process_id = str(doc.get("revit_process_id") or "").strip()
-        document_path = doc.get("document_path")
-        project_uid = doc.get("project_uid")
-        document_title = doc.get("document_title")
-
-        # First look for the exact current identity.
-        row = db.get(DocumentRecord, document_id)
-
-        # If the identity changed but the physical live document did not,
-        # retire the old row. Do NOT merge different Revit processes.
-        conflicts = db.query(DocumentRecord).filter(
-            DocumentRecord.machine_id == machine_id,
-            DocumentRecord.revit_process_id == process_id,
-            DocumentRecord.is_online.is_(True),
-        ).all()
-        for old_row in conflicts:
-            if old_row.document_id != document_id and _same_physical_document(
-                old_row, machine_id, process_id, document_path, project_uid, document_title
-            ):
-                old_row.is_online = False
-
-        if row is None:
-            row = DocumentRecord(document_id=document_id)
-            db.add(row)
-
-        seen_ids.add(document_id)
-        row.machine_id = machine_id
-        row.revit_instance_id = doc.get("revit_instance_id") or instance_id
-        row.revit_process_id = process_id
-        row.session_id = doc.get("session_id") or session_id
-        row.project_uid = project_uid
-        row.document_title = document_title
-        row.document_path = document_path
-        row.revit_version = doc.get("revit_version")
-        row.is_online = True
-        row.last_seen = now()
-
-    # IMPORTANT: only this Revit instance owns this slice of the registry.
-    # Documents belonging to other Revit processes on the same machine are
-    # completely untouched.
-    q = db.query(DocumentRecord).filter(DocumentRecord.machine_id == machine_id)
-    if instance_id:
-        q = q.filter(DocumentRecord.revit_instance_id == instance_id)
-    elif session_id:
-        q = q.filter(DocumentRecord.session_id == session_id)
-    else:
-        return
-
-    for row in q.all():
-        if row.document_id not in seen_ids:
-            row.is_online = False
-
-
-@router.post("/register")
-def register_agent(body: dict, db: Session = Depends(get_db), x_workstation_id: str = Header(default="")):
-    _validate_agent_identity(body, x_workstation_id)
-    machine_id = body.get("machine_id", "")
-    documents = body.get("documents", [])
-    machine_name = documents[0].get("machine_name") if documents else None
-    agent_instance_id = body.get("revit_instance_id", "")
-    agent_id = str(body.get("agent_id") or "").strip()
-    agent_session_id = body.get("session_id", "")
-
-    _upsert_system(db, machine_id, agent_id, machine_name, status="online")
-    _upsert_documents(db, machine_id, agent_instance_id, agent_session_id, documents)
-    db.commit()
-    sys_row = db.get(SystemRecord, machine_id)
-    return {"status": "registered", "agent_id": sys_row.agent_id, "machine_id": machine_id, "documents_seen": len(documents)}
-
-
-@router.post("/heartbeat")
-def heartbeat_agent(body: dict, db: Session = Depends(get_db), x_workstation_id: str = Header(default="")):
-    _validate_agent_identity(body, x_workstation_id)
-    machine_id = body.get("machine_id", "")
-    documents = body.get("documents", [])
-    machine_name = documents[0].get("machine_name") if documents else None
-    agent_instance_id = body.get("revit_instance_id", "")
-    agent_id = str(body.get("agent_id") or "").strip()
-    agent_session_id = body.get("session_id", "")
-
-    _upsert_system(db, machine_id, agent_id, machine_name, status="online")
-    _upsert_documents(db, machine_id, agent_instance_id, agent_session_id, documents)
-    db.commit()
-    sys_row = db.get(SystemRecord, machine_id)
-    return {"status": "ok", "agent_id": sys_row.agent_id, "machine_id": machine_id}
-
-
-@router.get("/debug/raw")
-def debug_raw(db: Session = Depends(get_db)):
-    """
-    Diagnostic only: dumps every DocumentRecord row exactly as stored, with
-    NO is_online filter and NO staleness sweep applied. Use this to see the
-    raw ground truth in the DB when /list shows a document but /resolve or
-    /create can't find it - it tells you whether the row actually has
-    is_online=True/False and what its real last_seen is, instead of
-    guessing about timing or environment differences.
-    """
-    docs = db.query(DocumentRecord).all()
-    current = now()
-    return {
-        "server_time_utc": current.isoformat(),
-        "documents": [
-            {
-                "document_id": d.document_id,
-                "machine_id": d.machine_id,
-                "project_uid": d.project_uid,
-                "document_title": d.document_title,
-                "is_online": d.is_online,
-                "last_seen": d.last_seen.isoformat() if d.last_seen else None,
-                "seconds_since_seen": (current - d.last_seen).total_seconds() if d.last_seen else None,
-            }
-            for d in docs
-        ],
+def _row(p: PayloadRecord, full=False):
+    d = {
+        "payload_id": p.payload_id, "logical_id": p.logical_id, "file_name": p.file_name, "status": p.status,
+        "error_code": p.error_code, "last_error": p.last_error, "item_count": p.item_count, "priority": p.priority,
+        "target_source": p.target_source, "target_spec": p.target_spec,
+        "selected": {"agent_id": p.selected_agent_id, "machine_id": p.selected_machine_id, "document_id": p.selected_document_id,
+                     "revit_instance_id": p.selected_instance_id,
+                     "revit_process_id": p.selected_process_id, "session_id": p.selected_session_id},
+        "command_id": p.command_id, "attempts": p.attempts, "max_attempts": p.max_attempts,
+        "discovered_at": p.discovered_at.isoformat() if p.discovered_at else None,
+        "queued_at": p.queued_at.isoformat() if p.queued_at else None,
+        "completed_at": p.completed_at.isoformat() if p.completed_at else None,
+        "next_attempt_at": p.next_attempt_at.isoformat() if p.next_attempt_at else None,
+        "result_summary": p.result_summary,
     }
+    if p.status in ("NO_TARGET", "AMBIGUOUS_TARGET") and p.candidates:
+        d["candidates"] = p.candidates
+    if full:
+        d["depends_on"] = p.depends_on
+        d["on_uncertain"] = p.on_uncertain
+    return d
 
 
-@router.get("/list")
-def list_agents(db: Session = Depends(get_db)):
+MAX_UPLOAD_BYTES = int(os.environ.get("MEPF_PAYLOAD_MAX_UPLOAD_BYTES", os.environ.get("COMMAND_MAX_PAYLOAD_BYTES", "5000000")))
+
+
+def _latest_for_file(db, file_name):
+    return (db.query(PayloadRecord)
+            .filter(PayloadRecord.file_name == file_name)
+            .order_by(PayloadRecord.discovered_at.desc())
+            .first())
+
+
+@router.get("")
+def list_payloads(status: str | None = None, limit: int = Query(default=100, le=500), db: Session = Depends(get_db)):
+    q = db.query(PayloadRecord)
+    if status:
+        q = q.filter(PayloadRecord.status == status.upper())
+    return [_row(p) for p in q.order_by(PayloadRecord.discovered_at.desc()).limit(limit).all()]
+
+
+@router.get("/routing-map")
+def routing_map():
+    return pm.load_routing_map(force=True)
+
+
+@router.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    """Upload a real payload.json file and immediately run one routing pass.
+
+    The body is validated as JSON before it is accepted.  The file is written
+    atomically for audit/operator visibility, while the parsed payload is also
+    stored in PostgreSQL by the payload manager, so execution does not depend
+    on Render's ephemeral filesystem surviving a restart.
     """
-    Returns ALL machines that are CURRENTLY online, i.e. whose agent has
-    sent a heartbeat within OFFLINE_THRESHOLD_SEC. Each machine appears as
-    ONE row. The response keeps the legacy flat "documents" list and also
-    exposes "revit_instances", grouped as machine -> Revit instance ->
-    document. The caller can therefore display every live system first and
-    only create a command after the user selects an exact target.
-    """
-    mark_stale_offline(db)
-    rows = db.query(SystemRecord).all()
-    current_time = now()
-    result = []
-    for r in rows:
-        if r.last_seen is None:
-            continue
-        seconds_since = (current_time - r.last_seen).total_seconds()
-        if seconds_since > OFFLINE_THRESHOLD_SEC:
-            # Stale -> agent stopped heartbeating (Revit closed on this
-            # machine). Skip it; don't touch any other machine's row.
-            continue
+    name = os.path.basename((file.filename or "").strip())
+    if not name or not name.lower().endswith(".json") or name.startswith("."):
+        raise HTTPException(status_code=422, detail="file must be a plain *.json filename")
 
-        docs = (
-            db.query(DocumentRecord)
-            .filter(DocumentRecord.machine_id == r.machine_id, DocumentRecord.is_online == True)
-            .all()
-        )
-
-        # Build an explicit hierarchy:
-        #   machine -> Revit instance -> open documents
-        # This lets the caller show ALL live systems first and then let the
-        # user choose the exact Revit process/document.
-        instance_map = {}
-        for d in docs:
-            instance_id = d.revit_instance_id or ""
-            instance = instance_map.setdefault(instance_id, {
-                "revit_instance_id": d.revit_instance_id,
-                "revit_process_id": d.revit_process_id,
-                "session_id": d.session_id,
-                "revit_version": d.revit_version,
-                "documents": [],
-            })
-            instance["documents"].append({
-                "document_id": d.document_id,
-                "project_uid": d.project_uid,
-                "document_title": d.document_title,
-                "document_path": d.document_path,
-                "revit_version": d.revit_version,
-                "last_seen": d.last_seen.isoformat() if d.last_seen else None,
-            })
-
-        # Stable ordering makes the UI predictable between refreshes.
-        for instance in instance_map.values():
-            instance["documents"].sort(key=lambda x: (x["document_title"] or "", x["document_id"] or ""))
-        revit_instances = sorted(
-            instance_map.values(),
-            key=lambda x: (str(x.get("revit_process_id") or ""), str(x.get("revit_instance_id") or "")),
-        )
-
-        result.append({
-            "agent_id": r.agent_id,
-            "machine_id": r.machine_id,
-            "machine_name": r.machine_name,
-            "status": "online",
-            "last_seen": r.last_seen.isoformat(),
-            # Backward-compatible flat list. Existing clients can keep using it.
-            "documents": [
-                {
-                    "document_id": d.document_id,
-                    "revit_instance_id": d.revit_instance_id,
-                    "revit_process_id": d.revit_process_id,
-                    "session_id": d.session_id,
-                    "project_uid": d.project_uid,
-                    "document_title": d.document_title,
-                    "document_path": d.document_path,
-                    "revit_version": d.revit_version,
-                    "last_seen": d.last_seen.isoformat() if d.last_seen else None,
-                }
-                for d in docs
-            ],
-            # New explicit hierarchy for the "show all systems first" UI.
-            "revit_instances": revit_instances,
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail={
+            "code": "payload_too_large",
+            "max_bytes": MAX_UPLOAD_BYTES,
+        })
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except Exception as ex:
+        raise HTTPException(status_code=422, detail={
+            "code": "invalid_json",
+            "message": str(ex),
         })
 
-    # The user should see the complete live registry before selecting a target.
-    result.sort(key=lambda x: (str(x.get("machine_name") or "").lower(), str(x.get("machine_id") or "")))
-    return result
+    pm.ensure_dirs()
+    tmp = os.path.join(pm._inbox(), "." + name + ".tmp")
+    final = os.path.join(pm._inbox(), name)
+    if os.path.exists(final):
+        raise HTTPException(status_code=409, detail="a file with this name is already waiting in inbox/")
+
+    # Store the exact uploaded JSON atomically.  The scanner is the single
+    # path that creates the durable PayloadRecord, avoiding duplicate rows.
+    with open(tmp, "wb") as f:
+        f.write(raw)
+    os.replace(tmp, final)
+
+    # Do not make the caller wait for Revit.  One synchronous pass gives an
+    # immediate routing/validation result; the background watcher continues
+    # tracking CLAIMED/EXECUTING/SUCCEEDED/FAILED afterwards.
+    pm.tick()
+
+    db = SessionLocal()
+    try:
+        p = _latest_for_file(db, name)
+        if p is None:
+            raise HTTPException(status_code=500, detail="payload was uploaded but not discovered by the router")
+        response = _row(p, full=True)
+    finally:
+        db.close()
+
+    response["status_url"] = "/api/payloads/{}".format(response["payload_id"])
+    response["execution_is_async"] = True
+
+    if response["status"] in ("INVALID", "DUPLICATE"):
+        raise HTTPException(status_code=422 if response["status"] == "INVALID" else 409, detail=response)
+    if response["status"] == "NO_TARGET":
+        # The payload remains persisted and will be retried automatically if a
+        # live agent appears, but this request is NOT reported as accepted for execution.
+        raise HTTPException(status_code=409, detail={
+            **response,
+            "message": "No eligible live Revit document is currently available. The payload is retained and will be retried automatically.",
+        })
+    return response
+
+
+@router.post("/preview")
+def preview(body: dict, file_name: str = "preview.json", db: Session = Depends(get_db)):
+    return pm.preview(db, body, file_name)
+
+
+@router.post("/scan")
+def scan_now():
+    return pm.tick()
+
+
+@router.get("/{payload_id}")
+def detail(payload_id: str, db: Session = Depends(get_db)):
+    p = db.get(PayloadRecord, payload_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="Unknown payload_id")
+    events = db.query(PayloadEventRecord).filter(PayloadEventRecord.payload_id == payload_id).order_by(PayloadEventRecord.id.asc()).all()
+    out = _row(p, full=True)
+    out["events"] = [{"event": e.event, "details": e.details, "at": e.created_at.isoformat()} for e in events]
+    if p.command_id:
+        c = db.get(CommandRecord, p.command_id)
+        out["command"] = {"status": c.status, "attempts": c.attempts, "lease_owner": c.lease_owner, "last_error": c.last_error} if c else None
+    return out
+
+
+@router.post("/{payload_id}/retry")
+def retry(payload_id: str, force: bool = False, db: Session = Depends(get_db)):
+    p, outcome = pm.retry(db, payload_id, force=force)
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail="Unknown payload_id")
+    if outcome != "requeued":
+        raise HTTPException(status_code=409, detail={"code": outcome, "status": p.status if p else None})
+    return {"status": "requeued", "payload_id": payload_id}
+
+
+@router.post("/{payload_id}/cancel")
+def cancel(payload_id: str, db: Session = Depends(get_db)):
+    p, ok = pm.cancel(db, payload_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="Unknown payload_id")
+    if not ok:
+        raise HTTPException(status_code=409, detail={"code": "cannot_cancel", "status": p.status,
+                                                     "hint": "already claimed by an agent or already finished"})
+    return {"status": "cancelled", "payload_id": payload_id}
