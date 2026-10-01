@@ -1,0 +1,12 @@
+{
+  "aliases": {},
+  "file_rules": [
+    {
+      "file_glob": "Payload_testing_model_2022.0001_2022.json",
+      "selector": {
+        "document_title": "Payload_testing_model",
+        "revit_version": "2022"
+      }
+    }
+  ]
+}
